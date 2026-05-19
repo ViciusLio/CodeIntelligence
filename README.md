@@ -29,7 +29,6 @@ with a local LLM **or** Claude API — same commands, same results.
 | **Model** | qwen2.5-coder, codellama, llama3… | claude-opus-4-7 |
 | **API key** | not required | `ANTHROPIC_API_KEY` |
 | **Data privacy** | stays on your machine | sent to Anthropic |
-| **Speed** | depends on hardware | fast |
 | **Quality** | good (7B–13B models) | excellent |
 | **Cost** | free | pay per token |
 | **Best for** | internal / sensitive repos | highest quality answers |
@@ -57,7 +56,7 @@ CodeIntelligence/
 ├── embed_chunks.py      # Step 2 (optional) — enrich chunks with Ollama embeddings
 ├── ask_repo.py          # Query via Claude API  (anthropic SDK)
 ├── ask_repo_local.py    # Query via Ollama      (stdlib only)
-└── rag_server.py        # HTTP server — exposes OpenAI + Ollama compatible endpoints
+└── rag_server.py        # HTTP server — OpenAI + Anthropic + Ollama endpoints + chat UI
 ```
 
 ---
@@ -98,81 +97,50 @@ Found 122 Python files
 Wrote 1,561 chunks → repo_chunks.jsonl
 ```
 
-### Step 2 — Ask questions
-
-**Option A — interactive CLI (Ollama)**
-```bash
-python ask_repo_local.py repo_chunks.jsonl --model qwen2.5-coder:7b --top-k 4 --no-stream
-# → interactive mode, type your questions
-```
-
-**Option B — single question**
-```bash
-python ask_repo_local.py repo_chunks.jsonl "How does the authentication flow work?" \
-    --model qwen2.5-coder:7b --top-k 4 --no-stream
-```
-
-**Option C — expose as API and connect any frontend**
-```bash
-python rag_server.py repo_chunks.jsonl --port 8080 --model qwen2.5-coder:7b
-```
-
----
-
-## Serving the API — connect any frontend
-
-`rag_server.py` starts an HTTP server that speaks both **OpenAI** and **Ollama** protocols
-simultaneously — no frontend changes needed.
+### Step 2 — Start the server
 
 ```bash
 python rag_server.py repo_chunks.jsonl --port 8080 --model qwen2.5-coder:7b
 ```
 
-```
-RAG Server starting...
-  Chunks     : 1561 from repo_chunks.jsonl
-  LLM model  : qwen2.5-coder:7b  (via Ollama at http://localhost:11434)
-  Retrieval  : TF-IDF  |  top_k: 6
-
-  OpenAI endpoint : http://localhost:8080/v1/chat/completions
-  Ollama endpoint : http://localhost:8080/api/chat
-  Health check    : http://localhost:8080/health
-```
-
-### Connect your frontend
-
-| Frontend | Configuration |
-|----------|---------------|
-| **Open WebUI** | Settings → Connections → Ollama URL: `http://localhost:8080` |
-| **LibreChat** | `OLLAMA_BASE_URL=http://localhost:8080` |
-| **Chatbox** | Provider: Ollama → URL: `http://localhost:8080` |
-| **Any OpenAI SDK/client** | `base_url="http://localhost:8080/v1"`, `api_key="rag"` |
-
-### Test with curl
-
-```bash
-# OpenAI format
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"rag","messages":[{"role":"user","content":"Where is JWT implemented?"}],"stream":false}'
-
-# Ollama format
-curl http://localhost:8080/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"model":"rag","messages":[{"role":"user","content":"Where is JWT implemented?"}],"stream":false}'
-
-# Simple query endpoint
-curl http://localhost:8080/query \
-  -H "Content-Type: application/json" \
-  -d '{"question":"How does the rate limiter work?"}'
-```
+Then open **http://localhost:8080** — a built-in chat UI is ready.
 
 ---
 
-## Improving retrieval quality — semantic embeddings
+## Built-in Chat UI
 
-By default, retrieval uses TF-IDF (keyword matching). For better results on complex
-questions, you can switch to semantic retrieval using Ollama embeddings.
+Open `http://localhost:8080` in any browser after starting the server.
+
+- Dark theme chat with streaming tokens visible as they arrive
+- "Thinking..." animation while the model is working
+- Badges showing model, backend, and chunk count
+- Enter to send · Shift+Enter for new line
+- No frontend to install — served directly by `rag_server.py`
+
+---
+
+## Retrieval modes — TF-IDF vs Semantic
+
+By default the server uses TF-IDF (keyword matching). For significantly better results
+on questions involving synonyms, acronyms, or concept-level reasoning, switch to
+**semantic retrieval** using Ollama embeddings.
+
+### The difference in practice
+
+> Question: *"Where is JWT token creation implemented?"*
+
+| | TF-IDF | Semantic |
+|--|--------|----------|
+| File found | ❌ hallucinated `app/utils/jwt.py` | ✅ `app/core/security.py` |
+| Answer | invented | based on real code |
+| Claims listed | generic | exact: `sub`, `iat`, `exp`, `type`, `jti` |
+
+TF-IDF matches the word "JWT" literally — it misses `create_access_token` in `security.py`
+because the word "JWT" doesn't appear enough in that chunk.
+Semantic embeddings understand that *"JWT token creation"* and *"create_access_token"*
+refer to the same concept.
+
+### Setup semantic retrieval
 
 ```bash
 # 1. Pull the embedding model (~270 MB, very fast)
@@ -182,23 +150,116 @@ ollama pull nomic-embed-text
 python embed_chunks.py repo_chunks.jsonl
 # → writes repo_chunks_embedded.jsonl
 
-# 3. Use semantic retrieval
-python ask_repo_local.py repo_chunks_embedded.jsonl "Where is JWT implemented?" \
-    --embed --model qwen2.5-coder:7b --top-k 4 --no-stream
-
-# Or via the server
-python rag_server.py repo_chunks_embedded.jsonl --embed --port 8080
+# 3. Start the server with semantic retrieval
+python rag_server.py repo_chunks_embedded.jsonl --port 8080 --embed --model qwen2.5-coder:7b
 ```
 
-### TF-IDF vs Semantic
+### How embed_chunks.py works
 
-| | TF-IDF | Semantic (nomic-embed-text) |
-|--|--------|-----------------------------|
-| Setup | none | `ollama pull nomic-embed-text` + `embed_chunks.py` |
-| Query latency | < 1ms | ~50ms (embed query + cosine similarity) |
-| Finds exact keywords | yes | yes |
-| Finds synonyms / concepts | no | **yes** |
-| Example: "JWT" finds `create_access_token` | no | **yes** |
+```
+repo_chunks.jsonl (text only)
+        │
+        ▼  embed_chunks.py calls Ollama /api/embeddings for each chunk
+        │  (nomic-embed-text → 768-dimensional vector per chunk)
+        ▼
+repo_chunks_embedded.jsonl  (same chunks + "embedding": [...] field)
+        │
+        ▼  at query time: embed the question → cosine similarity → top-k
+```
+
+Supports `--resume` to safely continue an interrupted embedding run.
+
+---
+
+## Serving the API — connect any frontend
+
+`rag_server.py` exposes **four API formats simultaneously**:
+
+```bash
+python rag_server.py repo_chunks.jsonl --port 8080 --model qwen2.5-coder:7b
+```
+
+```
+  Chat UI           : http://localhost:8080/
+  OpenAI endpoint   : http://localhost:8080/v1/chat/completions
+  Anthropic endpoint: http://localhost:8080/v1/messages
+  Ollama endpoint   : http://localhost:8080/api/chat
+  Health check      : http://localhost:8080/health
+```
+
+### Connect your frontend
+
+| Frontend | Configuration |
+|----------|---------------|
+| **Browser** | open `http://localhost:8080` |
+| **Open WebUI** | Settings → Connections → Ollama URL: `http://localhost:8080` |
+| **LibreChat** | `OLLAMA_BASE_URL=http://localhost:8080` |
+| **Chatbox** | Provider: Ollama → URL: `http://localhost:8080` |
+| **OpenAI SDK** | `base_url="http://localhost:8080/v1"`, `api_key="rag"` |
+| **Anthropic SDK** | `base_url="http://localhost:8080"`, `api_key="rag"` |
+
+### Connect via SDK
+
+```python
+# OpenAI SDK
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="rag")
+response = client.chat.completions.create(
+    model="rag",
+    messages=[{"role": "user", "content": "Where is JWT implemented?"}]
+)
+
+# Anthropic SDK
+import anthropic
+client = anthropic.Anthropic(base_url="http://localhost:8080", api_key="rag")
+response = client.messages.create(
+    model="rag", max_tokens=1024,
+    messages=[{"role": "user", "content": "Where is JWT implemented?"}]
+)
+```
+
+### Test with curl
+
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# Simple query (easiest)
+curl http://localhost:8080/query \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Where is JWT token creation implemented?"}'
+
+# OpenAI format
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"rag","messages":[{"role":"user","content":"How does rate limiting work?"}],"stream":false}'
+
+# Anthropic format
+curl http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model":"rag","max_tokens":1024,"messages":[{"role":"user","content":"How does rate limiting work?"}]}'
+```
+
+---
+
+## Using Claude API as backend
+
+You can replace Ollama with Claude as the generation backend — same endpoints,
+same UI, better quality answers.
+
+```bash
+# With --claude flag (uses claude-opus-4-7 by default)
+python rag_server.py repo_chunks.jsonl --port 8080 --claude --api-key sk-...
+
+# Or via environment variable
+export ANTHROPIC_API_KEY=sk-...
+python rag_server.py repo_chunks.jsonl --port 8080 --claude
+```
+
+The health check tells you which backend is active:
+```json
+{"status": "ok", "chunks": 1561, "model": "claude-opus-4-7", "backend": "claude", "retrieval": "tfidf"}
+```
 
 ---
 
@@ -208,28 +269,30 @@ python rag_server.py repo_chunks_embedded.jsonl --embed --port 8080
 ```
 python parse_repo.py <repo_path> [--output chunks.jsonl] [--exclude <pattern>]
 
-  --output   Output JSONL file     (default: repo_chunks.jsonl)
-  --exclude  Skip paths matching pattern (repeatable, e.g. --exclude tests --exclude migrations)
+  --output   Output JSONL file      (default: repo_chunks.jsonl)
+  --exclude  Skip paths matching pattern (repeatable)
+             e.g. --exclude tests --exclude migrations
 ```
 
 ### embed_chunks.py
 ```
-python embed_chunks.py <chunks.jsonl> [--output embedded.jsonl] [--model nomic-embed-text] [--resume]
+python embed_chunks.py <chunks.jsonl> [options]
 
-  --output   Output file           (default: <input>_embedded.jsonl)
-  --model    Ollama embedding model (default: nomic-embed-text)
-  --resume   Skip already-embedded chunks (safe to re-run after interruption)
+  --output       Output file          (default: <input>_embedded.jsonl)
+  --model        Ollama embedding model (default: nomic-embed-text)
+  --url          Ollama base URL      (default: http://localhost:11434)
+  --resume       Skip already-embedded chunks (safe to re-run after interruption)
 ```
 
 ### ask_repo_local.py
 ```
 python ask_repo_local.py <chunks.jsonl> ["question"] [options]
 
-  --model        Ollama LLM model    (default: codellama)
-  --top-k        Chunks to retrieve  (default: 12)
-  --embed        Use semantic retrieval
-  --embed-model  Embedding model     (default: nomic-embed-text)
-  --no-stream    Print full answer at once instead of streaming
+  --model        Ollama LLM model     (default: codellama)
+  --top-k        Chunks to retrieve   (default: 12)
+  --embed        Use semantic retrieval (needs embedded JSONL)
+  --embed-model  Embedding model      (default: nomic-embed-text)
+  --no-stream    Print full answer at once
   --all-chunks   Send all chunks as context
 ```
 
@@ -237,26 +300,14 @@ python ask_repo_local.py <chunks.jsonl> ["question"] [options]
 ```
 python rag_server.py <chunks.jsonl> [options]
 
-  --port         Listening port      (default: 8080)
-  --model        Ollama LLM model    (default: qwen2.5-coder:7b)
-  --top-k        Chunks per query    (default: 6)
-  --embed        Use semantic retrieval
-  --embed-model  Embedding model     (default: nomic-embed-text)
-  --ollama       Ollama base URL     (default: http://localhost:11434)
-```
-
----
-
-## Use with Claude API
-
-If you prefer Claude over a local model, `ask_repo.py` uses the Anthropic SDK
-with `claude-opus-4-7` and adaptive thinking:
-
-```bash
-pip install anthropic
-export ANTHROPIC_API_KEY=sk-...
-
-python ask_repo.py repo_chunks.jsonl "Explain the permission system" --top-k 8
+  --port         Listening port       (default: 8080)
+  --model        Ollama LLM model     (default: qwen2.5-coder:7b)
+  --top-k        Chunks per query     (default: 6)
+  --embed        Use semantic retrieval (needs embedded JSONL)
+  --embed-model  Embedding model      (default: nomic-embed-text)
+  --ollama       Ollama base URL      (default: http://localhost:11434)
+  --claude       Use Claude API as backend instead of Ollama
+  --api-key      Anthropic API key    (or set ANTHROPIC_API_KEY)
 ```
 
 ---
@@ -266,21 +317,33 @@ python ask_repo.py repo_chunks.jsonl "Explain the permission system" --top-k 8
 This toolkit was built alongside three purpose-made benchmark repositories
 for evaluating RAG pipelines on Python code:
 
-| Repo | Size | Domain |
-|------|------|--------|
-| [ci-bench-L1](https://github.com/ViciusLio/ci-bench-L1) | ~6k lines | Validation library |
-| [ci-bench-L2](https://github.com/ViciusLio/ci-bench-L2) | ~12k lines | FastAPI REST service |
-| [ci-bench-L3](https://github.com/ViciusLio/ci-bench-L3) | ~18k lines | Pipeline framework |
+| Repo | Size | Domain | Chunks |
+|------|------|--------|--------|
+| [ci-bench-L1](https://github.com/ViciusLio/ci-bench-L1) | ~6k lines | Validation library | 584 |
+| [ci-bench-L2](https://github.com/ViciusLio/ci-bench-L2) | ~12k lines | FastAPI REST service | 1,561 |
+| [ci-bench-L3](https://github.com/ViciusLio/ci-bench-L3) | ~18k lines | Pipeline framework | 2,977 |
 
 Each repo includes ground truth Q&A pairs and evaluation metrics (Hit@K, MRR, MAP, NDCG)
 so you can measure exactly how well your pipeline performs.
 
 ```bash
-# Parse and query ci-bench-L2 in one go
-python parse_repo.py ../ci-bench-L2 --output ci_bench_L2_chunks.jsonl
-python rag_server.py ci_bench_L2_chunks.jsonl --port 8080
+# Full end-to-end example with ci-bench-L2
+git clone https://github.com/ViciusLio/ci-bench-L2
 
-# Then run the benchmark evaluation
+# Parse
+python parse_repo.py ../ci-bench-L2 --output ci_bench_L2_chunks.jsonl
+
+# Embed (recommended)
+ollama pull nomic-embed-text
+python embed_chunks.py ci_bench_L2_chunks.jsonl
+
+# Start server with semantic retrieval
+python rag_server.py ci_bench_L2_chunks_embedded.jsonl --port 8080 --embed
+
+# Open the chat UI
+open http://localhost:8080
+
+# Run the benchmark evaluation
 cd ../ci-bench-L2
 python benchmarks/eval_harness.py --rag-url http://localhost:8080 --output results.json
 ```

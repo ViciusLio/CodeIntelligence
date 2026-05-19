@@ -8,3 +8,9 @@ __pycache__/
 
 # Local results
 results_*.json
+
+# Claude Code session data
+.claude/
+
+# Local presentation files
+*.html
