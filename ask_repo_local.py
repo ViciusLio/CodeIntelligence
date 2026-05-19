@@ -18,6 +18,8 @@ Options:
     --embed                 Use semantic retrieval (needs embed_chunks.py output)
     --all-chunks            Send all chunks (broad questions)
     --no-stream             Disable streaming output
+    --rerank                Rerank retrieved chunks with a cross-encoder
+                            (requires: pip install sentence-transformers)
 
 Workflow with semantic retrieval:
     # Step 1 — embed once (a few minutes)
@@ -190,6 +192,7 @@ def ask_ollama(
     stream: bool = True,
     use_embed: bool = False,
     embed_model: str = "nomic-embed-text",
+    use_rerank: bool = False,
 ) -> tuple[str, int]:
     """
     Call Ollama's /api/chat endpoint with the retrieved context.
@@ -198,9 +201,21 @@ def ask_ollama(
     if all_chunks:
         relevant = chunks
     elif use_embed:
-        relevant = retrieve_semantic(chunks, question, top_k, embed_model, base_url)
+        # When reranking: fetch top_k * 3 candidates, then rerank to top_k
+        candidate_k = top_k * 3 if use_rerank else top_k
+        relevant = retrieve_semantic(chunks, question, candidate_k, embed_model, base_url)
     else:
-        relevant = retrieve(chunks, question, top_k)
+        candidate_k = top_k * 3 if use_rerank else top_k
+        relevant = retrieve(chunks, question, candidate_k)
+
+    # Cross-encoder reranking (opt-in)
+    if use_rerank and not all_chunks:
+        try:
+            from rerank import rerank  # type: ignore
+            relevant = rerank(question, relevant, top_n=top_k)
+        except ImportError:
+            print("[warn] rerank.py not found — skipping reranking", file=sys.stderr)
+
     context = build_context(relevant)
     n_chunks = len(relevant)
 
@@ -291,9 +306,11 @@ def main():
     all_chunks  = "--all-chunks" in args
     no_stream   = "--no-stream"  in args
     use_embed   = "--embed"      in args
-    if all_chunks: args.remove("--all-chunks")
-    if no_stream:  args.remove("--no-stream")
-    if use_embed:  args.remove("--embed")
+    use_rerank  = "--rerank"     in args
+    if all_chunks:  args.remove("--all-chunks")
+    if no_stream:   args.remove("--no-stream")
+    if use_embed:   args.remove("--embed")
+    if use_rerank:  args.remove("--rerank")
 
     if not args:
         print("Error: missing <chunks.jsonl> argument", file=sys.stderr)
@@ -310,7 +327,8 @@ def main():
     print(f"Loaded {len(chunks)} chunks from {jsonl_path}")
     print(f"Model     : {model}  (Ollama at {base_url})")
     retrieval_mode = f"semantic ({embed_model})" if use_embed else "TF-IDF"
-    print(f"Retrieval : {retrieval_mode}  |  top_k: {top_k}  |  stream: {not no_stream}")
+    rerank_label = " + cross-encoder rerank" if use_rerank else ""
+    print(f"Retrieval : {retrieval_mode}{rerank_label}  |  top_k: {top_k}  |  stream: {not no_stream}")
     print()
 
     if question:
@@ -322,6 +340,7 @@ def main():
             top_k=top_k, all_chunks=all_chunks,
             stream=not no_stream,
             use_embed=use_embed, embed_model=embed_model,
+            use_rerank=use_rerank,
         )
         if no_stream:
             print(f"A: {answer}")
@@ -349,6 +368,7 @@ def main():
                 top_k=top_k, all_chunks=all_chunks,
                 stream=not no_stream,
                 use_embed=use_embed, embed_model=embed_model,
+                use_rerank=use_rerank,
             )
             if no_stream:
                 print(f"A: {answer}")

@@ -350,6 +350,169 @@ python benchmarks/eval_harness.py --rag-url http://localhost:8080 --output resul
 
 ---
 
+## Advanced
+
+### Cross-encoder reranking (`--rerank`)
+
+Retrieval quality can be improved by adding a **cross-encoder reranker** as a second stage.
+Instead of comparing a query embedding against chunk embeddings in isolation, the cross-encoder
+reads every (query, chunk) pair together and scores their relevance — much more accurate but
+also more CPU-intensive.
+
+```bash
+# Install the dependency (~80 MB, CPU-friendly)
+pip install sentence-transformers
+
+# Use reranking with semantic retrieval (recommended)
+python ask_repo_local.py repo_chunks_embedded.jsonl "Where is JWT created?" \
+    --embed --rerank --top-k 5
+
+# Use reranking with TF-IDF retrieval
+python ask_repo_local.py repo_chunks.jsonl "Where is JWT created?" \
+    --rerank --top-k 5
+
+# Enable on the server
+python rag_server.py repo_chunks_embedded.jsonl --embed --rerank
+```
+
+When `--rerank` is active, the pipeline retrieves `top_k * 3` candidates via the initial
+retrieval method, then re-scores them with `cross-encoder/ms-marco-MiniLM-L-6-v2` and
+returns the best `top_k`.
+
+If `sentence-transformers` is not installed, the flag is silently ignored and the original
+ranking is used — no crash, no noise.
+
+The health endpoint reflects the active reranker:
+```json
+{"status": "ok", "reranker": "cross-encoder", "vector_store": "numpy_in_memory", ...}
+```
+
+---
+
+### ChromaDB persistent vector store (`--chroma`)
+
+By default semantic retrieval loads all embeddings into memory on every server start.
+For large repos (millions of embeddings) you can use **ChromaDB** as a persistent vector store.
+
+```bash
+# Install ChromaDB
+pip install chromadb
+
+# Build the index once (idempotent — safe to re-run)
+python chroma_store.py build repo_chunks_embedded.jsonl
+
+# Query the index directly (uses Ollama to embed the question)
+python chroma_store.py query repo_chunks_embedded.jsonl "how does auth work" --top-k 5
+
+# Show collection info
+python chroma_store.py info repo_chunks_embedded.jsonl
+
+# Start the server with ChromaDB (--chroma requires --embed)
+python rag_server.py repo_chunks_embedded.jsonl --embed --chroma
+```
+
+ChromaDB persists data in `.codeintelligence_chroma/` in the current directory.
+Multiple repos coexist in the same Chroma instance because each gets its own
+collection named after the JSONL file stem.
+
+```bash
+# Custom persist directory
+python rag_server.py repo_chunks_embedded.jsonl --embed --chroma --chroma-dir /data/chroma
+```
+
+The health endpoint reflects the active store:
+```json
+{"status": "ok", "vector_store": "chroma", "reranker": "none", ...}
+```
+
+---
+
+### Usages / call-graph chunks (parse_repo.py)
+
+By default `parse_repo.py` now also emits `usages` chunks — cross-file call graph entries
+that let the RAG system answer questions like *"Who calls `create_access_token`?"*.
+
+```bash
+# Default — includes usages chunks
+python parse_repo.py /my/repo --output chunks.jsonl
+
+# Opt-out if you want the old behaviour (no usages chunks)
+python parse_repo.py /my/repo --output chunks.jsonl --no-usages
+```
+
+---
+
+### Multi-language parsing (`--include-langs`)
+
+By default only Python files are parsed.  Pass `--include-langs` to also parse
+Markdown, YAML/TOML config files, and JavaScript/TypeScript files.
+
+```bash
+# Parse everything
+python parse_repo.py /my/repo \
+    --include-langs markdown config js \
+    --output chunks.jsonl
+
+# Only add Markdown docs
+python parse_repo.py /my/repo --include-langs markdown --output chunks.jsonl
+```
+
+| Lang key | Extensions | Chunk type |
+|----------|------------|------------|
+| `markdown` | `.md`, `.mdx` | `doc` — one chunk per H1/H2 section |
+| `config` | `.yml`, `.yaml`, `.toml` | `config` — one chunk per file with top-level keys |
+| `js` | `.js`, `.ts`, `.jsx`, `.tsx` | `file_js` — exports, imports, classes |
+
+---
+
+### Incremental embedding (`--incremental`)
+
+After the initial embedding run, re-embedding only the files that changed saves time on
+large repos.  The tool stores a sidecar `<output>_file_hashes.json` with the SHA-256
+hash of every source file.
+
+```bash
+# First run — embeds everything
+python embed_chunks.py repo_chunks.jsonl
+
+# After editing a few files — only re-embeds changed files
+python embed_chunks.py repo_chunks.jsonl --incremental
+
+# Output:
+#   3 files unchanged (embeddings reused)
+#   1 files changed/new (re-embedded)
+#   1561 chunks total
+```
+
+`--incremental` and `--resume` are independent flags and can be combined.
+
+### All new flags summary
+
+#### parse_repo.py
+```
+  --no-usages            Skip emitting usages/call-graph chunks
+  --include-langs <l>    Also parse: markdown  config  js  (space-separated)
+```
+
+#### embed_chunks.py
+```
+  --incremental          Skip re-embedding unchanged source files (uses SHA-256 hashing)
+```
+
+#### ask_repo_local.py
+```
+  --rerank               Re-score retrieved chunks with a cross-encoder (sentence-transformers)
+```
+
+#### rag_server.py
+```
+  --rerank               Re-score retrieved chunks with a cross-encoder
+  --chroma               Use ChromaDB as persistent vector store (requires --embed)
+  --chroma-dir <dir>     ChromaDB persistence directory (default: .codeintelligence_chroma/)
+```
+
+---
+
 ## License
 
 MIT — free to use for internal tooling, research, and commercial evaluation.

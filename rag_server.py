@@ -15,6 +15,8 @@ Options:
     --top-k    <n>     Chunks per query        (default: 6)
     --embed            Use semantic retrieval  (needs embed_chunks.py output)
     --embed-model <m>  Embedding model         (default: nomic-embed-text)
+    --rerank           Rerank with cross-encoder (requires sentence-transformers)
+    --chroma           Use ChromaDB vector store (requires chromadb, implies --embed)
 
 Endpoints exposed (both formats simultaneously):
 
@@ -118,26 +120,63 @@ def _embed_text(text: str) -> list[float]:
 def retrieve(question: str) -> list[dict]:
     top_k = CONFIG["top_k"]
     chunks = CHUNKS
+    use_rerank = CONFIG.get("use_rerank", False)
 
-    if CONFIG["use_embed"]:
+    # When reranking we over-fetch (top_k * 3) so the cross-encoder has more
+    # candidates to re-score before we trim to top_k.
+    candidate_k = top_k * 3 if use_rerank else top_k
+
+    if CONFIG.get("use_chroma") and CONFIG.get("chroma_collection") is not None:
+        # ChromaDB semantic retrieval
         try:
+            from chroma_store import query_chroma  # type: ignore
             qvec = _embed_text(question)
-            scored = [
-                (c, _cosine(qvec, c["embedding"]))
-                for c in chunks if "embedding" in c
-            ]
+            top = query_chroma(CONFIG["chroma_collection"], qvec, top_k=candidate_k)
         except Exception:
-            scored = [(c, _tf_score(_tokenize(question), c["text"])) for c in chunks]
+            # Fallback to numpy cosine if Chroma fails
+            top = _numpy_retrieve(question, candidate_k)
+    elif CONFIG["use_embed"]:
+        top = _numpy_retrieve(question, candidate_k)
     else:
         tokens = _tokenize(question)
         scored = [(c, _tf_score(tokens, c["text"])) for c in chunks]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = [c for c, _ in scored[:candidate_k]]
 
-    scored.sort(key=lambda x: x[1], reverse=True)
-    top = [c for c, _ in scored[:top_k]]
+    # Always include repo_overview for grounding
     overview = next((c for c in chunks if c["type"] == "repo_overview"), None)
     if overview and overview not in top:
-        top = [overview] + top[: top_k - 1]
+        top = [overview] + top[: candidate_k - 1]
+
+    # Cross-encoder reranking
+    if use_rerank:
+        try:
+            from rerank import rerank  # type: ignore
+            top = rerank(question, top, top_n=top_k)
+        except ImportError:
+            pass  # degrade gracefully
+
+    # Trim to top_k if we didn't rerank (rerank already trims)
+    if not use_rerank:
+        top = top[:top_k]
+
     return top
+
+
+def _numpy_retrieve(question: str, candidate_k: int) -> list[dict]:
+    """In-memory cosine similarity retrieval (numpy-free pure Python)."""
+    chunks = CHUNKS
+    try:
+        qvec = _embed_text(question)
+        scored = [
+            (c, _cosine(qvec, c["embedding"]))
+            for c in chunks if "embedding" in c
+        ]
+    except Exception:
+        scored = [(c, _tf_score(_tokenize(question), c["text"])) for c in chunks]
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [c for c, _ in scored[:candidate_k]]
 
 
 def build_context(chunks: list[dict]) -> str:
@@ -281,12 +320,16 @@ class RAGHandler(BaseHTTPRequestHandler):
             self._serve_ui()
         elif self.path == "/health":
             backend = "claude" if CONFIG.get("use_claude") else "ollama"
+            reranker = "cross-encoder" if CONFIG.get("use_rerank") else "none"
+            vector_store = "chroma" if CONFIG.get("use_chroma") else "numpy_in_memory"
             self._json({
                 "status": "ok",
                 "chunks": len(CHUNKS),
                 "model": CONFIG["model"],
                 "backend": backend,
                 "retrieval": "semantic" if CONFIG.get("use_embed") else "tfidf",
+                "reranker": reranker,
+                "vector_store": vector_store,
             })
         elif self.path == "/v1/models":
             self._openai_models()
@@ -1018,10 +1061,19 @@ def main():
     top_k       = int(_pop_arg(args, "--top-k")       or 6)
     embed_model = _pop_arg(args, "--embed-model")     or "nomic-embed-text"
     api_key     = _pop_arg(args, "--api-key")         or ""
+    chroma_dir  = _pop_arg(args, "--chroma-dir")      or None
     use_embed   = "--embed"   in args
     use_claude  = "--claude"  in args
+    use_rerank  = "--rerank"  in args
+    use_chroma  = "--chroma"  in args
     if use_embed:  args.remove("--embed")
     if use_claude: args.remove("--claude")
+    if use_rerank: args.remove("--rerank")
+    if use_chroma: args.remove("--chroma")
+
+    if use_chroma and not use_embed:
+        print("Error: --chroma requires --embed (semantic mode)", file=sys.stderr)
+        sys.exit(1)
 
     import os
     if use_claude:
@@ -1048,6 +1100,22 @@ def main():
         if line:
             CHUNKS.append(json.loads(line))
 
+    # Initialise ChromaDB collection if requested
+    chroma_collection = None
+    if use_chroma:
+        try:
+            from chroma_store import build_chroma_index  # type: ignore
+            chroma_collection = build_chroma_index(
+                str(jsonl_path),
+                persist_dir=chroma_dir,
+            )
+        except ImportError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as exc:
+            print(f"Error initialising ChromaDB: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     CONFIG = {
         "model": model,
         "ollama_url": ollama_url,
@@ -1056,15 +1124,20 @@ def main():
         "embed_model": embed_model,
         "use_claude": use_claude,
         "claude_api_key": api_key,
+        "use_rerank": use_rerank,
+        "use_chroma": use_chroma,
+        "chroma_collection": chroma_collection,
     }
 
     retrieval = f"semantic ({embed_model})" if use_embed else "TF-IDF"
+    rerank_label = " + cross-encoder rerank" if use_rerank else ""
+    vector_store_label = " [ChromaDB]" if use_chroma else " [numpy in-memory]"
     backend = f"Claude API ({model})" if use_claude else f"Ollama ({model} at {ollama_url})"
 
     print(f"RAG Server starting...")
     print(f"  Chunks     : {len(CHUNKS)} from {jsonl_path.name}")
     print(f"  Backend    : {backend}")
-    print(f"  Retrieval  : {retrieval}  |  top_k: {top_k}")
+    print(f"  Retrieval  : {retrieval}{rerank_label}{vector_store_label}  |  top_k: {top_k}")
     print(f"  Port       : {port}")
     print()
     print(f"  OpenAI endpoint   : http://localhost:{port}/v1/chat/completions")

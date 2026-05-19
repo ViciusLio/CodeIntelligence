@@ -1,5 +1,5 @@
 """
-parse_repo.py — Parse a Python repository into semantic RAG chunks.
+parse_repo.py — Parse a repository into semantic RAG chunks.
 
 Generates repo_chunks.jsonl where each line is a self-contained chunk
 ready for TF-IDF retrieval or embedding.
@@ -8,17 +8,24 @@ Usage:
     python parse_repo.py <repo_path>
     python parse_repo.py <repo_path> --output my_chunks.jsonl
     python parse_repo.py <repo_path> --exclude tests --exclude .venv
+    python parse_repo.py <repo_path> --no-usages
+    python parse_repo.py <repo_path> --include-langs markdown config js
 
 Chunk types produced:
     repo_overview              — folder structure, top-level packages, entry points
     file::<path>               — per .py file: imports, exports, module docstring
     function::<file>::<name>   — signature, docstring, full body, called functions
     class::<file>::<name>      — methods, attributes, inheritance
+    usages::<file>::<symbol>   — cross-file call graph (opt-out via --no-usages)
+    doc::<path>::<heading>     — Markdown section (--include-langs markdown)
+    config::<path>             — YAML/TOML config file (--include-langs config)
+    file_js::<path>            — JS/TS file (--include-langs js)
 
 Output format (one JSON object per line):
     {
       "id":       "<type>::<locator>",
-      "type":     "repo_overview" | "file" | "function" | "class",
+      "type":     "repo_overview" | "file" | "function" | "class" | "usages"
+                  | "doc" | "config" | "file_js",
       "text":     "<human-readable, embedding-ready prose>",
       "metadata": { ... type-specific structured fields ... }
     }
@@ -34,7 +41,7 @@ import re
 import sys
 import textwrap
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, List
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +197,7 @@ def _class_attributes(node: ast.ClassDef) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Chunk builders
+# Chunk builders — Python
 # ---------------------------------------------------------------------------
 
 def build_file_chunk(path: Path, root: Path, tree: ast.Module, source: str) -> dict:
@@ -480,6 +487,403 @@ def chunks_for_file(path: Path, root: Path) -> Iterator[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Improvement 2 — Usage index builder
+# ---------------------------------------------------------------------------
+
+def build_usage_index(chunks: List[dict]) -> List[dict]:
+    """
+    Analyse already-parsed function/class chunks and emit "usages" chunks.
+
+    Returns a list of new chunks (appended at end of output so existing tooling
+    that streams the JSONL is unaffected).
+
+    Two kinds of usages:
+      - Function/method call graph: symbol -> list of (caller_file, caller_name)
+      - Class import index: class_name -> list of files that import it
+    """
+    # ---- Step 1: build global symbol table (name -> defining file) ----
+    symbol_to_file: dict[str, str] = {}  # symbol_name -> defining_file slug
+
+    for chunk in chunks:
+        if chunk["type"] == "function":
+            meta = chunk.get("metadata", {})
+            name = meta.get("name", "")
+            file_ = meta.get("file", "")
+            if name and file_:
+                symbol_to_file[name] = file_
+        elif chunk["type"] == "class":
+            meta = chunk.get("metadata", {})
+            name = meta.get("name", "")
+            file_ = meta.get("file", "")
+            if name and file_:
+                symbol_to_file[name] = file_
+
+    # ---- Step 2: build call graph reverse index ----
+    # call_index[symbol_name] = list of {"file": caller_file, "caller": caller_name}
+    call_index: dict[str, List[dict]] = {}
+
+    for chunk in chunks:
+        if chunk["type"] != "function":
+            continue
+        meta = chunk.get("metadata", {})
+        caller_name = meta.get("name", "")
+        caller_file = meta.get("file", "")
+        calls = meta.get("calls", [])
+        for called in calls:
+            if called not in symbol_to_file:
+                continue  # not a known symbol in this repo
+            defined_file = symbol_to_file[called]
+            if defined_file == caller_file:
+                continue  # same-file call — less interesting
+            if called not in call_index:
+                call_index[called] = []
+            # avoid duplicates
+            entry = {"file": caller_file, "caller": caller_name}
+            if entry not in call_index[called]:
+                call_index[called].append(entry)
+
+    # ---- Step 3: build class import index ----
+    # class_import_index[class_name] = list of files that import it
+    class_import_index: dict[str, List[str]] = {}
+
+    for chunk in chunks:
+        if chunk["type"] != "file":
+            continue
+        meta = chunk.get("metadata", {})
+        file_ = meta.get("path", "")
+        from_imports = meta.get("from_imports", [])
+        for fi in from_imports:
+            # from_import format: "module.ClassName"
+            parts = fi.split(".")
+            for part in parts:
+                if part in symbol_to_file and symbol_to_file[part] != file_:
+                    # looks like a class import
+                    if part not in class_import_index:
+                        class_import_index[part] = []
+                    if file_ not in class_import_index[part]:
+                        class_import_index[part].append(file_)
+
+    # ---- Step 4: emit usages chunks ----
+    usages_chunks: List[dict] = []
+
+    # Function call usages
+    for symbol, callers in sorted(call_index.items()):
+        if not callers:
+            continue
+        defined_file = symbol_to_file.get(symbol, "unknown")
+        caller_lines = [
+            f"  - {c['caller']} in {c['file']}" for c in callers
+        ]
+        text = (
+            f"Symbol: {symbol} (defined in {defined_file})\n"
+            f"Called by:\n" + "\n".join(caller_lines)
+        )
+        usages_chunks.append({
+            "id": f"usages::{defined_file}::{symbol}",
+            "type": "usages",
+            "text": text,
+            "metadata": {
+                "symbol": symbol,
+                "defined_in": defined_file,
+                "callers": callers,
+            },
+        })
+
+    # Class import usages (only for classes with cross-file imports)
+    for class_name, importing_files in sorted(class_import_index.items()):
+        if not importing_files:
+            continue
+        defined_file = symbol_to_file.get(class_name, "unknown")
+        # Skip if we already emitted a call-usages chunk for this symbol
+        if any(uc["metadata"].get("symbol") == class_name for uc in usages_chunks):
+            continue
+        import_lines = [f"  - {f}" for f in importing_files]
+        text = (
+            f"Symbol: {class_name} (defined in {defined_file})\n"
+            f"Imported by:\n" + "\n".join(import_lines)
+        )
+        usages_chunks.append({
+            "id": f"usages::{defined_file}::{class_name}",
+            "type": "usages",
+            "text": text,
+            "metadata": {
+                "symbol": class_name,
+                "defined_in": defined_file,
+                "callers": [{"file": f, "caller": "import"} for f in importing_files],
+            },
+        })
+
+    return usages_chunks
+
+
+# ---------------------------------------------------------------------------
+# Improvement 4 — Multi-language parsers
+# ---------------------------------------------------------------------------
+
+def parse_markdown_file(path: Path, root: Path) -> List[dict]:
+    """Parse a Markdown/MDX file into section chunks (one per H1/H2 heading)."""
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        print(f"  [skip] cannot read {path}: {exc}", file=sys.stderr)
+        return []
+
+    slug = _slug(path, root)
+    chunks: List[dict] = []
+
+    # Split on H1 or H2 headings
+    # Pattern: line starting with one or two # followed by space
+    header_pattern = re.compile(r"^(#{1,2})\s+(.+)", re.MULTILINE)
+    matches = list(header_pattern.finditer(source))
+
+    if not matches:
+        # No headers — emit whole file as one chunk
+        words = source.split()
+        text_body = " ".join(words[:800])
+        if len(words) > 800:
+            text_body += " …"
+        chunks.append({
+            "id": f"doc::{slug}::__root__",
+            "type": "doc",
+            "text": f"# {path.stem}\n\n{text_body}",
+            "metadata": {
+                "path": slug,
+                "heading": path.stem,
+                "level": 0,
+                "word_count": len(words),
+            },
+        })
+        return chunks
+
+    # Extract sections
+    for i, match in enumerate(matches):
+        level = len(match.group(1))  # 1 or 2
+        heading = match.group(2).strip()
+        section_start = match.start()
+        section_end = matches[i + 1].start() if i + 1 < len(matches) else len(source)
+        body = source[section_start:section_end].strip()
+
+        words = body.split()
+        if len(words) > 800:
+            body = " ".join(words[:800]) + " …"
+        word_count = len(words)
+
+        chunks.append({
+            "id": f"doc::{slug}::{heading}",
+            "type": "doc",
+            "text": body,
+            "metadata": {
+                "path": slug,
+                "heading": heading,
+                "level": level,
+                "word_count": word_count,
+            },
+        })
+
+    return chunks
+
+
+def parse_yaml_file(path: Path, root: Path) -> List[dict]:
+    """Parse a YAML config file into one chunk."""
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        print(f"  [skip] cannot read {path}: {exc}", file=sys.stderr)
+        return []
+
+    slug = _slug(path, root)
+    top_level_keys: List[str] = []
+
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(source)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                type_name = type(v).__name__
+                top_level_keys.append(f"{k} ({type_name})")
+    except ImportError:
+        # Fallback: regex-based top-level key extraction
+        for line in source.splitlines():
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):\s*(.*)", line)
+            if m:
+                k = m.group(1)
+                v = m.group(2)[:50]
+                top_level_keys.append(f"{k} ({v!r})" if v else k)
+    except Exception:
+        pass
+
+    preview_lines = source.splitlines()[:30]
+    text = (
+        f"Config file: {slug}\n"
+        f"Top-level keys: {', '.join(top_level_keys) if top_level_keys else '(none parsed)'}\n"
+        f"Content preview:\n" + "\n".join(preview_lines)
+    )
+
+    return [{
+        "id": f"config::{slug}",
+        "type": "config",
+        "text": text,
+        "metadata": {
+            "path": slug,
+            "format": "yaml",
+            "top_level_keys": [k.split(" (")[0] for k in top_level_keys],
+        },
+    }]
+
+
+def parse_toml_file(path: Path, root: Path) -> List[dict]:
+    """Parse a TOML config file into one chunk."""
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        print(f"  [skip] cannot read {path}: {exc}", file=sys.stderr)
+        return []
+
+    slug = _slug(path, root)
+    top_level_keys: List[str] = []
+
+    try:
+        # Python 3.11+
+        import tomllib  # type: ignore
+        data = tomllib.loads(source)
+        for k, v in data.items():
+            type_name = type(v).__name__
+            top_level_keys.append(f"{k} ({type_name})")
+    except ImportError:
+        try:
+            import tomli  # type: ignore
+            data = tomli.loads(source)
+            for k, v in data.items():
+                type_name = type(v).__name__
+                top_level_keys.append(f"{k} ({type_name})")
+        except ImportError:
+            # Regex fallback: TOML top-level keys are [section] headers or key = value
+            for line in source.splitlines():
+                m_section = re.match(r"^\[([A-Za-z_][A-Za-z0-9_.]*)\]", line)
+                if m_section:
+                    top_level_keys.append(f"{m_section.group(1)} (section)")
+                    continue
+                m_kv = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.*)", line)
+                if m_kv:
+                    k = m_kv.group(1)
+                    v = m_kv.group(2)[:50]
+                    top_level_keys.append(f"{k} = {v}")
+    except Exception:
+        pass
+
+    preview_lines = source.splitlines()[:30]
+    text = (
+        f"Config file: {slug}\n"
+        f"Top-level keys: {', '.join(top_level_keys) if top_level_keys else '(none parsed)'}\n"
+        f"Content preview:\n" + "\n".join(preview_lines)
+    )
+
+    return [{
+        "id": f"config::{slug}",
+        "type": "config",
+        "text": text,
+        "metadata": {
+            "path": slug,
+            "format": "toml",
+            "top_level_keys": [k.split(" (")[0].split(" =")[0] for k in top_level_keys],
+        },
+    }]
+
+
+def parse_js_file(path: Path, root: Path) -> List[dict]:
+    """
+    Parse a JS/TS/JSX/TSX file using regex (no external AST library).
+
+    Extracts: exported functions, exported arrow functions, class definitions,
+    and import statements.
+    """
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        print(f"  [skip] cannot read {path}: {exc}", file=sys.stderr)
+        return []
+
+    slug = _slug(path, root)
+
+    # Exported functions: export function X or export default function X
+    export_fn_pattern = re.compile(
+        r"export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)"
+    )
+    # Exported arrow functions / const: export const X = (...) =>
+    export_arrow_pattern = re.compile(
+        r"export\s+(?:default\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\("
+    )
+    # Class definitions
+    class_pattern = re.compile(
+        r"class\s+(\w+)(?:\s+extends\s+(\w+))?"
+    )
+    # Import statements
+    import_pattern = re.compile(
+        r"import\s+(?:[^;]+?)\s+from\s+['\"]([^'\"]+)['\"]"
+    )
+
+    exports = list(dict.fromkeys(
+        export_fn_pattern.findall(source) + export_arrow_pattern.findall(source)
+    ))
+    classes = []
+    for m in class_pattern.finditer(source):
+        name = m.group(1)
+        base = m.group(2)
+        classes.append(f"{name}(extends {base})" if base else name)
+    classes = list(dict.fromkeys(classes))
+    imports = list(dict.fromkeys(import_pattern.findall(source)))
+
+    parts = []
+    if exports:
+        parts.append(f"Exports: {', '.join(exports)}")
+    if imports:
+        parts.append(f"Imports: {', '.join(imports[:20])}" + (" …" if len(imports) > 20 else ""))
+    if classes:
+        parts.append(f"Classes: {', '.join(classes)}")
+
+    text = f"JS/TS File: {slug}\n" + "\n".join(parts) if parts else f"JS/TS File: {slug}"
+
+    return [{
+        "id": f"file::{slug}",
+        "type": "file_js",
+        "text": text,
+        "metadata": {
+            "path": slug,
+            "exports": exports,
+            "imports": imports,
+            "classes": classes,
+        },
+    }]
+
+
+def iter_lang_files(root: Path, langs: List[str], exclude_patterns: List[str]) -> Iterator[tuple]:
+    """
+    Yield (path, lang) tuples for each non-Python file matching the requested langs.
+    """
+    patterns: List[tuple[str, str]] = []
+    if "markdown" in langs:
+        for glob in ("*.md", "*.mdx"):
+            patterns.append((glob, "markdown"))
+    if "config" in langs:
+        for glob in ("*.yml", "*.yaml", "*.toml"):
+            patterns.append((glob, "config"))
+    if "js" in langs:
+        for glob in ("*.js", "*.ts", "*.jsx", "*.tsx"):
+            patterns.append((glob, "js"))
+
+    seen: set[Path] = set()
+    for glob, lang in patterns:
+        for f in sorted(root.rglob(glob)):
+            if f in seen:
+                continue
+            seen.add(f)
+            rel = f.relative_to(root).as_posix()
+            skip = any(pat in rel for pat in exclude_patterns)
+            if not skip:
+                yield f, lang
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -494,10 +898,27 @@ def parse_repo(
     repo_path: str | Path,
     output_path: str | Path = "repo_chunks.jsonl",
     extra_excludes: list[str] | None = None,
+    include_usages: bool = True,
+    include_langs: list[str] | None = None,
 ) -> int:
     """
     Parse repo_path and write chunks to output_path.
     Returns the total number of chunks written.
+
+    Parameters
+    ----------
+    repo_path:
+        Path to the repository root directory.
+    output_path:
+        Destination JSONL file.
+    extra_excludes:
+        Extra path patterns to exclude.
+    include_usages:
+        If True (default), emit usages chunks after all file chunks.
+        Pass False to skip (equivalent to --no-usages CLI flag).
+    include_langs:
+        List of additional languages to parse. Supported: "markdown", "config", "js".
+        Default (None) parses Python only — backward compatible.
     """
     root = Path(repo_path).resolve()
     if not root.is_dir():
@@ -505,6 +926,7 @@ def parse_repo(
         sys.exit(1)
 
     excludes = DEFAULT_EXCLUDES + (extra_excludes or [])
+    langs = include_langs or []
 
     print(f"Scanning {root} …")
     py_files = list(iter_py_files(root, excludes))
@@ -515,12 +937,39 @@ def parse_repo(
     # repo overview first
     chunks.append(build_repo_overview(root, py_files, excludes))
 
-    # per-file chunks
+    # per-file Python chunks
     for i, f in enumerate(py_files, 1):
         file_chunks = list(chunks_for_file(f, root))
         chunks.extend(file_chunks)
         if i % 20 == 0 or i == len(py_files):
             print(f"  Parsed {i}/{len(py_files)} files — {len(chunks)} chunks so far …")
+
+    # multi-language chunks
+    if langs:
+        lang_count = 0
+        for f, lang in iter_lang_files(root, langs, excludes):
+            if lang == "markdown":
+                new_chunks = parse_markdown_file(f, root)
+            elif lang == "config":
+                suffix = f.suffix.lower()
+                if suffix == ".toml":
+                    new_chunks = parse_toml_file(f, root)
+                else:
+                    new_chunks = parse_yaml_file(f, root)
+            elif lang == "js":
+                new_chunks = parse_js_file(f, root)
+            else:
+                new_chunks = []
+            chunks.extend(new_chunks)
+            lang_count += len(new_chunks)
+        print(f"  Multi-lang: added {lang_count} chunks for {langs}")
+
+    # usages index (appended AFTER all file/function/class chunks)
+    if include_usages:
+        usages_chunks = build_usage_index(chunks)
+        chunks.extend(usages_chunks)
+        if usages_chunks:
+            print(f"  Usage index: added {len(usages_chunks)} usages chunks")
 
     # write JSONL
     out = Path(output_path)
@@ -554,6 +1003,14 @@ def _pop_multi(args: list[str], flag: str) -> list[str]:
     return values
 
 
+def _pop_flag(args: list[str], flag: str) -> bool:
+    """Pop a boolean flag from args.  Returns True if it was present."""
+    if flag in args:
+        args.remove(flag)
+        return True
+    return False
+
+
 def main():
     args = sys.argv[1:]
 
@@ -563,9 +1020,26 @@ def main():
 
     output = _pop_arg(args, "--output") or "repo_chunks.jsonl"
     excludes = _pop_multi(args, "--exclude")
+    no_usages = _pop_flag(args, "--no-usages")
+
+    # --include-langs can be given as repeated flags or space-separated after a single flag
+    # Strategy: collect all values after --include-langs until the next flag or end
+    include_langs: List[str] = []
+    while "--include-langs" in args:
+        idx = args.index("--include-langs")
+        args.pop(idx)
+        # collect following non-flag values
+        while idx < len(args) and not args[idx].startswith("--"):
+            include_langs.append(args.pop(idx))
 
     repo_path = args[0] if args else "."
-    parse_repo(repo_path, output, excludes)
+    parse_repo(
+        repo_path,
+        output,
+        excludes,
+        include_usages=not no_usages,
+        include_langs=include_langs if include_langs else None,
+    )
 
 
 if __name__ == "__main__":
