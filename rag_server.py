@@ -318,12 +318,20 @@ class RAGHandler(BaseHTTPRequestHandler):
     background: #141820;
   }}
   header h1 {{ font-size: 1.1rem; font-weight: 600; color: #7c9ef8; letter-spacing: .02em; }}
+  .header-right {{ display: flex; align-items: center; gap: 12px; }}
   .badges {{ display: flex; gap: 8px; }}
   .badge {{
     font-size: 0.72rem; padding: 3px 10px; border-radius: 999px;
     background: #1e2533; color: #94a3b8;
   }}
   .badge.green {{ background: #14291f; color: #4ade80; }}
+  #export-btn {{
+    font-size: 0.75rem; padding: 5px 14px; border-radius: 999px;
+    background: #1e2533; color: #7c9ef8; border: 1px solid #2d3748;
+    cursor: pointer; transition: background .15s; white-space: nowrap;
+  }}
+  #export-btn:hover {{ background: #2d3748; }}
+  #export-btn:disabled {{ opacity: .4; cursor: not-allowed; }}
   #chat {{
     flex: 1; overflow-y: auto; padding: 24px;
     display: flex; flex-direction: column; gap: 16px;
@@ -381,10 +389,13 @@ class RAGHandler(BaseHTTPRequestHandler):
 <body>
 <header>
   <h1>&#128269; CodeIntelligence</h1>
-  <div class="badges">
-    <span class="badge green">&#9679; {chunks_count} chunks</span>
-    <span class="badge">{backend}</span>
-    <span class="badge">{retrieval} retrieval</span>
+  <div class="header-right">
+    <div class="badges">
+      <span class="badge green">&#9679; {chunks_count} chunks</span>
+      <span class="badge">{backend}</span>
+      <span class="badge">{retrieval} retrieval</span>
+    </div>
+    <button id="export-btn" disabled title="Export session">&#8595; Export session</button>
   </div>
 </header>
 <div id="chat">
@@ -517,6 +528,145 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 140) + 'px';
   }});
+
+  // ---- session history & export ----
+  const SESSION = {{
+    started_at: new Date().toISOString(),
+    model: '{backend}',
+    retrieval: '{retrieval}',
+    chunks: {chunks_count},
+    turns: [],
+  }};
+
+  const exportBtn = document.getElementById('export-btn');
+
+  function recordTurn(question, answer) {{
+    SESSION.turns.push({{
+      timestamp: new Date().toISOString(),
+      question,
+      answer,
+    }});
+    exportBtn.disabled = false;
+  }}
+
+  function buildMarkdown() {{
+    const lines = [
+      '# CodeIntelligence — Session Report',
+      '',
+      `**Date:** ${{SESSION.started_at.replace('T',' ').slice(0,19)}} UTC`,
+      `**Model:** ${{SESSION.model}}`,
+      `**Retrieval:** ${{SESSION.retrieval}}`,
+      `**Chunks indexed:** ${{SESSION.chunks}}`,
+      `**Questions asked:** ${{SESSION.turns.length}}`,
+      '',
+      '---',
+      '',
+    ];
+    SESSION.turns.forEach((t, i) => {{
+      lines.push(`## Q${{i+1}} — ${{t.timestamp.replace('T',' ').slice(0,19)}} UTC`);
+      lines.push('');
+      lines.push(`**Question:** ${{t.question}}`);
+      lines.push('');
+      lines.push(`**Answer:**`);
+      lines.push('');
+      lines.push(t.answer);
+      lines.push('');
+      lines.push('---');
+      lines.push('');
+    }});
+    return lines.join('\\n');
+  }}
+
+  exportBtn.addEventListener('click', () => {{
+    if (SESSION.turns.length === 0) return;
+
+    // offer both Markdown and JSON
+    const fmt = window.confirm(
+      'Export as Markdown? (OK = .md, Cancel = .json)'
+    );
+
+    let content, filename, mime;
+    if (fmt) {{
+      content  = buildMarkdown();
+      filename = `ci_session_${{new Date().toISOString().slice(0,10)}}.md`;
+      mime     = 'text/markdown';
+    }} else {{
+      content  = JSON.stringify(SESSION, null, 2);
+      filename = `ci_session_${{new Date().toISOString().slice(0,10)}}.json`;
+      mime     = 'application/json';
+    }}
+
+    const blob = new Blob([content], {{ type: mime }});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }});
+
+  // patch ask() to record turns
+  const _originalAsk = ask;
+  window.ask = async function(question) {{
+    // capture answer after streaming completes
+    send.disabled = true;
+    addMessage('user', question);
+    const thinking = addThinking();
+    let fullAnswer = '';
+
+    try {{
+      const res = await fetch('/v1/chat/completions', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          model: 'rag',
+          messages: [{{ role: 'user', content: question }}],
+          stream: true,
+        }}),
+      }});
+
+      thinking.remove();
+      const bubble = addMessage('assistant', '');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {{
+        const {{ done, value }} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {{ stream: true }});
+        const lines = buffer.split('\\n');
+        buffer = lines.pop();
+        for (const line of lines) {{
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') break;
+          try {{
+            const obj = JSON.parse(data);
+            const token = obj.choices?.[0]?.delta?.content || '';
+            if (token) {{ bubble.textContent += token; fullAnswer += token; scrollBottom(); }}
+          }} catch {{}}
+        }}
+      }}
+    }} catch (e) {{
+      thinking.remove();
+      addMessage('assistant', 'Error: ' + e.message);
+      fullAnswer = 'Error: ' + e.message;
+    }}
+
+    recordTurn(question, fullAnswer);
+    send.disabled = false;
+    input.focus();
+  }};
+
+  // override the send handler to use the new ask
+  send.onclick = () => {{
+    const q = input.value.trim();
+    if (!q) return;
+    input.value = '';
+    input.style.height = 'auto';
+    window.ask(q);
+  }};
 </script>
 </body>
 </html>"""
