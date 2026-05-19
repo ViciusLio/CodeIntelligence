@@ -18,12 +18,34 @@ The result: ask questions like *"Where is JWT authentication implemented?"* or *
 
 ---
 
-## Why local?
+## Local or Cloud — your choice
 
-- **No data leaves your machine** — works entirely on localhost
-- **No API key needed** — uses Ollama with any open model
-- **No external dependencies** for the parser — pure Python stdlib (`ast`, `pathlib`, `json`)
-- **Model-agnostic** — the JSONL chunk format works with any LLM
+The chunk format is model-agnostic. Once you have `repo_chunks.jsonl` you can query it
+with a local LLM **or** Claude API — same commands, same results.
+
+| | Local (Ollama) | Cloud (Claude API) |
+|--|----------------|--------------------|
+| **Script** | `ask_repo_local.py` / `rag_server.py` | `ask_repo.py` |
+| **Model** | qwen2.5-coder, codellama, llama3… | claude-opus-4-7 |
+| **API key** | not required | `ANTHROPIC_API_KEY` |
+| **Data privacy** | stays on your machine | sent to Anthropic |
+| **Speed** | depends on hardware | fast |
+| **Quality** | good (7B–13B models) | excellent |
+| **Cost** | free | pay per token |
+| **Best for** | internal / sensitive repos | highest quality answers |
+
+```bash
+# Local — Ollama
+python ask_repo_local.py repo_chunks.jsonl "How does authentication work?" \
+    --model qwen2.5-coder:7b --top-k 4 --no-stream
+
+# Cloud — Claude API
+pip install anthropic
+export ANTHROPIC_API_KEY=sk-...
+python ask_repo.py repo_chunks.jsonl "How does authentication work?" --top-k 8
+```
+
+Both read the same `repo_chunks.jsonl` — no need to re-parse.
 
 ---
 
