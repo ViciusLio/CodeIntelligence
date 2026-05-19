@@ -277,7 +277,9 @@ class RAGHandler(BaseHTTPRequestHandler):
     # ---- routing ----
 
     def do_GET(self):
-        if self.path == "/health":
+        if self.path in ("/", "/ui"):
+            self._serve_ui()
+        elif self.path == "/health":
             backend = "claude" if CONFIG.get("use_claude") else "ollama"
             self._json({
                 "status": "ok",
@@ -292,6 +294,238 @@ class RAGHandler(BaseHTTPRequestHandler):
             self._ollama_tags()
         else:
             self._json({"error": "not found"}, 404)
+
+    def _serve_ui(self):
+        backend = "Claude API" if CONFIG.get("use_claude") else f"Ollama · {CONFIG['model']}"
+        retrieval = "Semantic" if CONFIG.get("use_embed") else "TF-IDF"
+        chunks_count = len(CHUNKS)
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CodeIntelligence</title>
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1117; color: #e2e8f0; height: 100vh;
+    display: flex; flex-direction: column;
+  }}
+  header {{
+    padding: 14px 24px; border-bottom: 1px solid #1e2533;
+    display: flex; align-items: center; justify-content: space-between;
+    background: #141820;
+  }}
+  header h1 {{ font-size: 1.1rem; font-weight: 600; color: #7c9ef8; letter-spacing: .02em; }}
+  .badges {{ display: flex; gap: 8px; }}
+  .badge {{
+    font-size: 0.72rem; padding: 3px 10px; border-radius: 999px;
+    background: #1e2533; color: #94a3b8;
+  }}
+  .badge.green {{ background: #14291f; color: #4ade80; }}
+  #chat {{
+    flex: 1; overflow-y: auto; padding: 24px;
+    display: flex; flex-direction: column; gap: 16px;
+  }}
+  .msg {{ display: flex; gap: 12px; max-width: 820px; }}
+  .msg.user {{ align-self: flex-end; flex-direction: row-reverse; }}
+  .avatar {{
+    width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.8rem; font-weight: 700;
+  }}
+  .msg.user .avatar {{ background: #3b4fd8; color: #fff; }}
+  .msg.assistant .avatar {{ background: #1e2533; color: #7c9ef8; }}
+  .bubble {{
+    padding: 12px 16px; border-radius: 14px; line-height: 1.6;
+    font-size: 0.92rem; white-space: pre-wrap; word-break: break-word;
+  }}
+  .msg.user .bubble {{ background: #2a3580; color: #e2e8f0; border-top-right-radius: 4px; }}
+  .msg.assistant .bubble {{ background: #1a1f2e; color: #cbd5e1; border-top-left-radius: 4px; }}
+  .meta {{ font-size: 0.7rem; color: #475569; margin-top: 4px; }}
+  .thinking {{
+    display: flex; gap: 4px; align-items: center; padding: 12px 16px;
+    background: #1a1f2e; border-radius: 14px; border-top-left-radius: 4px;
+  }}
+  .dot {{
+    width: 7px; height: 7px; border-radius: 50%; background: #475569;
+    animation: bounce 1.2s infinite ease-in-out;
+  }}
+  .dot:nth-child(2) {{ animation-delay: .2s; }}
+  .dot:nth-child(3) {{ animation-delay: .4s; }}
+  @keyframes bounce {{
+    0%, 80%, 100% {{ transform: scale(0.7); opacity: .5; }}
+    40% {{ transform: scale(1); opacity: 1; }}
+  }}
+  footer {{
+    padding: 16px 24px; border-top: 1px solid #1e2533; background: #141820;
+  }}
+  .input-row {{ display: flex; gap: 10px; max-width: 820px; margin: 0 auto; }}
+  #input {{
+    flex: 1; background: #1a1f2e; border: 1px solid #2d3748; border-radius: 10px;
+    color: #e2e8f0; padding: 12px 16px; font-size: 0.92rem; resize: none;
+    outline: none; line-height: 1.5; max-height: 140px; overflow-y: auto;
+  }}
+  #input:focus {{ border-color: #3b4fd8; }}
+  #send {{
+    background: #3b4fd8; color: #fff; border: none; border-radius: 10px;
+    padding: 0 20px; font-size: 1.1rem; cursor: pointer; transition: background .15s;
+    flex-shrink: 0;
+  }}
+  #send:hover {{ background: #4a5ee8; }}
+  #send:disabled {{ background: #2d3748; cursor: not-allowed; }}
+  .hint {{ text-align: center; font-size: 0.72rem; color: #334155; margin-top: 8px; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#128269; CodeIntelligence</h1>
+  <div class="badges">
+    <span class="badge green">&#9679; {chunks_count} chunks</span>
+    <span class="badge">{backend}</span>
+    <span class="badge">{retrieval} retrieval</span>
+  </div>
+</header>
+<div id="chat">
+  <div class="msg assistant">
+    <div class="avatar">AI</div>
+    <div>
+      <div class="bubble">Hi! Ask me anything about this Python repository.
+I have {chunks_count} semantic chunks indexed and ready.
+Try something like: <em>"How does authentication work?"</em> or <em>"Where is the rate limiter implemented?"</em></div>
+    </div>
+  </div>
+</div>
+<footer>
+  <div class="input-row">
+    <textarea id="input" rows="1" placeholder="Ask a question about the codebase..."></textarea>
+    <button id="send">&#8593;</button>
+  </div>
+  <div class="hint">Enter to send &nbsp;·&nbsp; Shift+Enter for new line</div>
+</footer>
+<script>
+  const chat = document.getElementById('chat');
+  const input = document.getElementById('input');
+  const send = document.getElementById('send');
+
+  function scrollBottom() {{
+    chat.scrollTop = chat.scrollHeight;
+  }}
+
+  function addMessage(role, text) {{
+    const wrap = document.createElement('div');
+    wrap.className = 'msg ' + role;
+    const av = document.createElement('div');
+    av.className = 'avatar';
+    av.textContent = role === 'user' ? 'You' : 'AI';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = text;
+    wrap.appendChild(av);
+    const inner = document.createElement('div');
+    inner.appendChild(bubble);
+    wrap.appendChild(inner);
+    chat.appendChild(wrap);
+    scrollBottom();
+    return bubble;
+  }}
+
+  function addThinking() {{
+    const wrap = document.createElement('div');
+    wrap.className = 'msg assistant';
+    wrap.id = 'thinking';
+    const av = document.createElement('div');
+    av.className = 'avatar';
+    av.textContent = 'AI';
+    const thinking = document.createElement('div');
+    thinking.className = 'thinking';
+    thinking.innerHTML = '<div class="dot"></div><div class="dot"></div><div class="dot"></div>';
+    wrap.appendChild(av);
+    const inner = document.createElement('div');
+    inner.appendChild(thinking);
+    wrap.appendChild(inner);
+    chat.appendChild(wrap);
+    scrollBottom();
+    return wrap;
+  }}
+
+  async function ask(question) {{
+    send.disabled = true;
+    addMessage('user', question);
+    const thinking = addThinking();
+
+    try {{
+      const res = await fetch('/v1/chat/completions', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          model: 'rag',
+          messages: [{{ role: 'user', content: question }}],
+          stream: true,
+        }}),
+      }});
+
+      thinking.remove();
+      const bubble = addMessage('assistant', '');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {{
+        const {{ done, value }} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {{ stream: true }});
+        const lines = buffer.split('\\n');
+        buffer = lines.pop();
+        for (const line of lines) {{
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') break;
+          try {{
+            const obj = JSON.parse(data);
+            const token = obj.choices?.[0]?.delta?.content || '';
+            if (token) {{ bubble.textContent += token; scrollBottom(); }}
+          }} catch {{}}
+        }}
+      }}
+    }} catch (e) {{
+      thinking.remove();
+      addMessage('assistant', 'Error: ' + e.message);
+    }}
+
+    send.disabled = false;
+    input.focus();
+  }}
+
+  send.addEventListener('click', () => {{
+    const q = input.value.trim();
+    if (!q) return;
+    input.value = '';
+    input.style.height = 'auto';
+    ask(q);
+  }});
+
+  input.addEventListener('keydown', e => {{
+    if (e.key === 'Enter' && !e.shiftKey) {{
+      e.preventDefault();
+      send.click();
+    }}
+  }});
+
+  input.addEventListener('input', () => {{
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 140) + 'px';
+  }});
+</script>
+</body>
+</html>"""
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         body = self._read_body()
