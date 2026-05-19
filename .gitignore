@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated chunk files (run parse_repo.py / embed_chunks.py to regenerate)
+*_chunks.jsonl
+*_chunks_embedded.jsonl
+
+# Local results
+results_*.json
