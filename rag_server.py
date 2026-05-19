@@ -278,7 +278,14 @@ class RAGHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json({"status": "ok", "chunks": len(CHUNKS), "model": CONFIG["model"]})
+            backend = "claude" if CONFIG.get("use_claude") else "ollama"
+            self._json({
+                "status": "ok",
+                "chunks": len(CHUNKS),
+                "model": CONFIG["model"],
+                "backend": backend,
+                "retrieval": "semantic" if CONFIG.get("use_embed") else "tfidf",
+            })
         elif self.path == "/v1/models":
             self._openai_models()
         elif self.path == "/api/tags":
@@ -290,6 +297,8 @@ class RAGHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         if self.path == "/v1/chat/completions":
             self._openai_chat(body)
+        elif self.path == "/v1/messages":
+            self._anthropic_messages(body)
         elif self.path == "/api/chat":
             self._ollama_chat(body)
         elif self.path == "/api/generate":
@@ -487,6 +496,92 @@ class RAGHandler(BaseHTTPRequestHandler):
         body["messages"] = [{"role": "user", "content": prompt}]
         self._ollama_chat(body)
 
+    # ---- Anthropic Messages API endpoint ----
+
+    def _anthropic_messages(self, body: dict):
+        """
+        POST /v1/messages — native Anthropic Messages API format.
+
+        Compatible with:
+            client = anthropic.Anthropic(base_url="http://localhost:8080", api_key="rag")
+            client.messages.create(model="rag", max_tokens=1024, messages=[...])
+        """
+        messages = body.get("messages", [])
+        stream = body.get("stream", False)
+        question = next(
+            (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
+        )
+        if not question:
+            self._json({"type": "error", "error": {"type": "invalid_request_error", "message": "no user message"}}, 400)
+            return
+
+        augmented_msgs, relevant = build_messages(question, messages)
+        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+
+        if stream:
+            # Anthropic SSE streaming format
+            self._sse_start()
+
+            def sse(event: str, data: dict):
+                self._write(f"event: {event}\ndata: {json.dumps(data)}\n\n")
+
+            sse("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "model": CONFIG["model"], "content": [],
+                    "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }
+            })
+            sse("content_block_start", {
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })
+            sse("ping", {"type": "ping"})
+
+            for item in _chat_stream(augmented_msgs):
+                if isinstance(item, str):
+                    token = item
+                else:
+                    line = item.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    token = obj.get("message", {}).get("content", "")
+                    if obj.get("done"):
+                        break
+                if token:
+                    sse("content_block_delta", {
+                        "type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": token},
+                    })
+
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": -1},
+            })
+            sse("message_stop", {"type": "message_stop"})
+        else:
+            answer = _chat_complete(augmented_msgs)
+            self._json({
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": CONFIG["model"],
+                "content": [{"type": "text", "text": answer}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": -1, "output_tokens": -1},
+                "_rag_chunks_used": len(relevant),
+            })
+
     # ---- Simple /query endpoint ----
 
     def _simple_query(self, body: dict):
@@ -588,12 +683,14 @@ def main():
     print(f"  Retrieval  : {retrieval}  |  top_k: {top_k}")
     print(f"  Port       : {port}")
     print()
-    print(f"  OpenAI endpoint : http://localhost:{port}/v1/chat/completions")
-    print(f"  Ollama endpoint : http://localhost:{port}/api/chat")
-    print(f"  Health check    : http://localhost:{port}/health")
+    print(f"  OpenAI endpoint   : http://localhost:{port}/v1/chat/completions")
+    print(f"  Anthropic endpoint: http://localhost:{port}/v1/messages")
+    print(f"  Ollama endpoint   : http://localhost:{port}/api/chat")
+    print(f"  Health check      : http://localhost:{port}/health")
     print()
-    print(f"  Connect Open WebUI  -> set Ollama URL to http://localhost:{port}")
-    print(f"  Connect any OpenAI client -> base_url=http://localhost:{port}/v1  api_key=rag")
+    print(f"  Connect Open WebUI      -> Ollama URL: http://localhost:{port}")
+    print(f"  Connect OpenAI client   -> base_url=http://localhost:{port}/v1   api_key=rag")
+    print(f"  Connect Anthropic SDK   -> base_url=http://localhost:{port}      api_key=rag")
     print()
     print("Press Ctrl+C to stop.\n")
 
