@@ -194,8 +194,46 @@ def _ollama_chat_complete(messages: list[dict]) -> str:
     return obj.get("message", {}).get("content", "")
 
 
-def build_messages(question: str, history: list[dict] | None = None) -> list[dict]:
-    """Build Ollama messages list with RAG context injected."""
+# ---------------------------------------------------------------------------
+# Claude API generation
+# ---------------------------------------------------------------------------
+
+def _claude_chat_stream(messages: list[dict]):
+    """Generator: yields text tokens from Claude streaming response."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=CONFIG["claude_api_key"])
+    # extract system from messages
+    system = next((m["content"] for m in messages if m["role"] == "system"), SYSTEM_PROMPT)
+    user_msgs = [m for m in messages if m["role"] != "system"]
+    with client.messages.stream(
+        model=CONFIG["model"],
+        max_tokens=2048,
+        thinking={"type": "adaptive"},
+        system=system,
+        messages=user_msgs,
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
+
+
+def _claude_chat_complete(messages: list[dict]) -> str:
+    """Non-streaming Claude call."""
+    import anthropic
+    client = anthropic.Anthropic(api_key=CONFIG["claude_api_key"])
+    system = next((m["content"] for m in messages if m["role"] == "system"), SYSTEM_PROMPT)
+    user_msgs = [m for m in messages if m["role"] != "system"]
+    response = client.messages.create(
+        model=CONFIG["model"],
+        max_tokens=2048,
+        thinking={"type": "adaptive"},
+        system=system,
+        messages=user_msgs,
+    )
+    return "".join(b.text for b in response.content if hasattr(b, "text"))
+
+
+def build_messages(question: str, history: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
+    """Build messages list with RAG context injected (works for both Ollama and Claude)."""
     relevant = retrieve(question)
     context = build_context(relevant)
     augmented_question = (
@@ -204,11 +242,27 @@ def build_messages(question: str, history: list[dict] | None = None) -> list[dic
     )
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
-        # include prior turns (without re-injecting context)
         for m in history[:-1]:
             msgs.append(m)
     msgs.append({"role": "user", "content": augmented_question})
     return msgs, relevant
+
+
+def _chat_stream(messages: list[dict]):
+    """Route streaming to Claude or Ollama based on config."""
+    if CONFIG.get("use_claude"):
+        for token in _claude_chat_stream(messages):
+            yield token   # yields str tokens
+    else:
+        for line in _ollama_chat_stream(messages):
+            yield line    # yields bytes lines
+
+
+def _chat_complete(messages: list[dict]) -> str:
+    """Route non-streaming to Claude or Ollama based on config."""
+    if CONFIG.get("use_claude"):
+        return _claude_chat_complete(messages)
+    return _ollama_chat_complete(messages)
 
 
 # ---------------------------------------------------------------------------
@@ -311,24 +365,26 @@ class RAGHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._sse_start()
-            # opening delta with role
             chunk = {
                 "id": comp_id, "object": "chat.completion.chunk",
                 "created": created, "model": "rag",
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
             }
             self._write(f"data: {json.dumps(chunk)}\n\n")
-            # stream tokens
-            for raw_line in _ollama_chat_stream(ollama_msgs):
-                line = raw_line.decode("utf-8").strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                token = obj.get("message", {}).get("content", "")
-                done = obj.get("done", False)
+            for item in _chat_stream(ollama_msgs):
+                if isinstance(item, str):
+                    token = item  # Claude yields str tokens directly
+                else:
+                    line = item.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    token = obj.get("message", {}).get("content", "")
+                    if obj.get("done"):
+                        break
                 if token:
                     chunk = {
                         "id": comp_id, "object": "chat.completion.chunk",
@@ -336,9 +392,6 @@ class RAGHandler(BaseHTTPRequestHandler):
                         "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None}]
                     }
                     self._write(f"data: {json.dumps(chunk)}\n\n")
-                if done:
-                    break
-            # closing chunk
             chunk = {
                 "id": comp_id, "object": "chat.completion.chunk",
                 "created": created, "model": "rag",
@@ -347,7 +400,7 @@ class RAGHandler(BaseHTTPRequestHandler):
             self._write(f"data: {json.dumps(chunk)}\n\n")
             self._write("data: [DONE]\n\n")
         else:
-            answer = _ollama_chat_complete(ollama_msgs)
+            answer = _chat_complete(ollama_msgs)
             self._json({
                 "id": comp_id,
                 "object": "chat.completion",
@@ -390,16 +443,20 @@ class RAGHandler(BaseHTTPRequestHandler):
 
         if stream:
             self._sse_start()
-            for raw_line in _ollama_chat_stream(ollama_msgs):
-                line = raw_line.decode("utf-8").strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                token = obj.get("message", {}).get("content", "")
-                done = obj.get("done", False)
+            for item in _chat_stream(ollama_msgs):
+                if isinstance(item, str):
+                    token = item
+                    done = False
+                else:
+                    line = item.decode("utf-8").strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    token = obj.get("message", {}).get("content", "")
+                    done = obj.get("done", False)
                 out = {
                     "model": "rag",
                     "created_at": created_at,
@@ -410,7 +467,7 @@ class RAGHandler(BaseHTTPRequestHandler):
                 if done:
                     break
         else:
-            answer = _ollama_chat_complete(ollama_msgs)
+            answer = _chat_complete(ollama_msgs)
             self._json({
                 "model": "rag",
                 "created_at": created_at,
@@ -441,7 +498,7 @@ class RAGHandler(BaseHTTPRequestHandler):
             self._json({"error": "missing question"}, 400)
             return
         ollama_msgs, relevant = build_messages(question)
-        answer = _ollama_chat_complete(ollama_msgs)
+        answer = _chat_complete(ollama_msgs)
         self._json({
             "answer": answer,
             "sources": [
@@ -481,9 +538,19 @@ def main():
     ollama_url  = _pop_arg(args, "--ollama")          or "http://localhost:11434"
     top_k       = int(_pop_arg(args, "--top-k")       or 6)
     embed_model = _pop_arg(args, "--embed-model")     or "nomic-embed-text"
-    use_embed   = "--embed" in args
-    if use_embed:
-        args.remove("--embed")
+    api_key     = _pop_arg(args, "--api-key")         or ""
+    use_embed   = "--embed"   in args
+    use_claude  = "--claude"  in args
+    if use_embed:  args.remove("--embed")
+    if use_claude: args.remove("--claude")
+
+    import os
+    if use_claude:
+        api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            print("Error: --claude requires --api-key or ANTHROPIC_API_KEY env var", file=sys.stderr)
+            sys.exit(1)
+        model = model if model != "qwen2.5-coder:7b" else "claude-opus-4-7"
 
     if not args:
         print("Error: missing <chunks.jsonl>", file=sys.stderr)
@@ -508,13 +575,16 @@ def main():
         "top_k": top_k,
         "use_embed": use_embed,
         "embed_model": embed_model,
+        "use_claude": use_claude,
+        "claude_api_key": api_key,
     }
 
     retrieval = f"semantic ({embed_model})" if use_embed else "TF-IDF"
+    backend = f"Claude API ({model})" if use_claude else f"Ollama ({model} at {ollama_url})"
 
     print(f"RAG Server starting...")
     print(f"  Chunks     : {len(CHUNKS)} from {jsonl_path.name}")
-    print(f"  LLM model  : {model}  (via Ollama at {ollama_url})")
+    print(f"  Backend    : {backend}")
     print(f"  Retrieval  : {retrieval}  |  top_k: {top_k}")
     print(f"  Port       : {port}")
     print()
