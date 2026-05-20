@@ -608,7 +608,7 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
     if (!q) return;
     input.value = '';
     input.style.height = 'auto';
-    ask(q);
+    window.ask(q);
   }});
 
   input.addEventListener('keydown', e => {{
@@ -868,7 +868,12 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
           }});
           const cdata = await cres.json();
           if (cdata.error) {{
-            alert('Escalation error: ' + cdata.error);
+            const errEl = document.createElement('div');
+            errEl.style.cssText = 'color:#fca5a5;margin-top:6px;font-size:0.82em;';
+            errEl.textContent = 'Claude API error: ' + cdata.error;
+            banner.appendChild(errEl);
+            banner.querySelector('.btn-escalate').disabled = false;
+            banner.querySelector('.btn-escalate').textContent = 'Retry';
             return;
           }}
           // Show Claude answer as a new bubble
@@ -894,9 +899,12 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
           // Record escalated answer in session export
           recordTurn('[Escalated] ' + question, '[Local] ' + localAnswer + '\\n\\n[Claude API] ' + (cdata.answer || ''), null);
         }} catch (err) {{
-          alert('Escalation failed: ' + err.message);
+          const errEl = document.createElement('div');
+          errEl.style.cssText = 'color:#fca5a5;margin-top:6px;font-size:0.82em;';
+          errEl.textContent = 'Connection error: ' + err.message;
+          banner.appendChild(errEl);
           banner.querySelector('.btn-escalate').disabled = false;
-          banner.querySelector('.btn-escalate').textContent = 'Use Claude API';
+          banner.querySelector('.btn-escalate').textContent = 'Retry';
         }}
       }});
 
@@ -910,14 +918,8 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
     }}
   }}
 
-  // override the send handler to use the new ask
-  send.onclick = () => {{
-    const q = input.value.trim();
-    if (!q) return;
-    input.value = '';
-    input.style.height = 'auto';
-    window.ask(q);
-  }};
+  // send.onclick was previously the entry point for window.ask;
+  // now the addEventListener above calls window.ask directly.
 </script>
 </body>
 </html>"""

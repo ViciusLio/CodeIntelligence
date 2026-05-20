@@ -41,6 +41,18 @@ _UNCERTAINTY_PHRASES_STRONG = [
     "outside the scope",
     "based on limited",
     "partial information",
+    # Variants frequently used by smaller local models (qwen, codellama, etc.)
+    "does not include any",       # "does not include any information on"
+    "does not contain any",       # "does not contain any information about"
+    "no information on",          # "there is no information on"
+    "no information about",       # "there is no information about"
+    "not explicitly",             # "not explicitly described/detailed/defined"
+    "not available in the",       # "not available in the context/provided context"
+    "not included in",            # "not included in the context"
+    "not detailed in",            # "not detailed in the provided context"
+    "not described in",           # "not described in the provided context"
+    "would need additional",      # "you would need additional context"
+    "additional context or",      # "additional context or documentation would be"
 ]
 
 _UNCERTAINTY_PHRASES_WEAK = [
@@ -270,7 +282,7 @@ def escalate_to_claude(
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-            "anthropic-beta": "interleaved-thinking-2025-05-14",
+            # Note: adaptive thinking on claude-opus-4-7 is GA -- no beta header needed.
         },
         method="POST",
     )
