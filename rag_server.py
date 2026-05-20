@@ -17,6 +17,11 @@ Options:
     --embed-model <m>  Embedding model         (default: nomic-embed-text)
     --rerank           Rerank with cross-encoder (requires sentence-transformers)
     --chroma           Use ChromaDB vector store (requires chromadb, implies --embed)
+    --escalation-threshold <f>  Confidence score below which escalation is suggested
+                                (default: 0.35)
+    --claude-api-key <key>      Anthropic API key for escalation endpoint.
+                                Can also be set via ANTHROPIC_API_KEY env var.
+                                Without this, /query/escalate returns 503.
 
 Endpoints exposed (both formats simultaneously):
 
@@ -32,6 +37,7 @@ Endpoints exposed (both formats simultaneously):
   Utility
     GET  /health
     POST /query                      (simple JSON: {"question":"...", "top_k":6})
+    POST /query/escalate             (confidence-based escalation to Claude API)
 
 Examples:
 
@@ -78,6 +84,9 @@ from pathlib import Path
 
 CONFIG: dict = {}
 CHUNKS: list[dict] = []
+# Stores the chunks retrieved for the most recent query so the escalation
+# endpoint can reference them when chunks_used_ids is empty.
+LAST_CHUNKS: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +282,9 @@ def _claude_chat_complete(messages: list[dict]) -> str:
 
 def build_messages(question: str, history: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     """Build messages list with RAG context injected (works for both Ollama and Claude)."""
+    global LAST_CHUNKS
     relevant = retrieve(question)
+    LAST_CHUNKS = relevant   # remember for /query/escalate
     context = build_context(relevant)
     augmented_question = (
         f"Context from the Python repository:\n\n{context}\n\n"
@@ -427,6 +438,40 @@ class RAGHandler(BaseHTTPRequestHandler):
   #send:hover {{ background: #4a5ee8; }}
   #send:disabled {{ background: #2d3748; cursor: not-allowed; }}
   .hint {{ text-align: center; font-size: 0.72rem; color: #334155; margin-top: 8px; }}
+  /* Escalation banner */
+  .escalation-banner {{
+    background: #7c3a00; border-left: 3px solid #f97316;
+    padding: 12px; border-radius: 6px; font-size: 0.85em;
+    margin-top: 6px; color: #fed7aa;
+  }}
+  .escalation-banner .esc-reason {{
+    display: block; font-size: 0.82em; color: #fdba74; margin-top: 2px;
+  }}
+  .escalation-banner .esc-score {{
+    font-size: 0.78em; color: #fb923c; margin-top: 2px; display: block;
+  }}
+  .escalation-actions {{
+    display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap;
+  }}
+  .escalation-actions button {{
+    font-size: 0.78em; padding: 4px 12px; border-radius: 6px;
+    border: 1px solid #c2410c; background: #9a3412; color: #fff;
+    cursor: pointer; transition: background .15s;
+  }}
+  .escalation-actions button:hover {{ background: #b45309; }}
+  .escalation-preview {{
+    background: #1a1010; border: 1px solid #7c3a00; border-radius: 6px;
+    padding: 10px; margin-top: 10px; font-family: monospace;
+    font-size: 0.78em; white-space: pre-wrap; color: #d1a87a;
+  }}
+  .claude-badge {{
+    display: inline-block; background: #1e3a8a; color: #93c5fd;
+    font-size: 0.7em; padding: 2px 8px; border-radius: 999px;
+    margin-left: 6px; vertical-align: middle;
+  }}
+  .confidence-mini {{
+    font-size: 0.68em; color: #475569; margin-top: 3px;
+  }}
 </style>
 </head>
 <body>
@@ -713,6 +758,9 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
       badge.textContent = '⏱ ' + (elapsed_ms / 1000).toFixed(1) + 's';
       bubble.parentNode.appendChild(badge);
 
+      // -- confidence check (fire-and-forget in background) --
+      checkEscalation(question, fullAnswer, bubble.parentNode);
+
     }} catch (e) {{
       clearInterval(timerInterval);
       thinking.remove();
@@ -725,6 +773,133 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
     send.disabled = false;
     input.focus();
   }};
+
+  // ---- Escalation helpers ----
+
+  async function checkEscalation(question, localAnswer, bubbleParent) {{
+    try {{
+      const res = await fetch('/query/escalate', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          question,
+          local_answer: localAnswer,
+          chunks_used_ids: [],
+          confirm: false,
+          redact_code: true,
+        }}),
+      }});
+      if (!res.ok) return;
+      const data = await res.json();
+
+      // Always show a mini confidence note
+      const miniScore = document.createElement('div');
+      miniScore.className = 'confidence-mini';
+      miniScore.textContent = 'Confidence score: ' + (data.confidence_score * 100).toFixed(0) + '%';
+      bubbleParent.appendChild(miniScore);
+
+      if (!data.should_escalate) return;
+
+      if (!data.escalation_available) {{
+        // Server has no API key -- show only the mini note
+        miniScore.textContent += '  ⚠ Low confidence — start server with --claude-api-key to enable escalation';
+        return;
+      }}
+
+      // Build the escalation banner
+      const banner = document.createElement('div');
+      banner.className = 'escalation-banner';
+      banner.innerHTML =
+        '⚠ Low confidence response (score: ' + (data.confidence_score * 100).toFixed(0) + '%)' +
+        '<span class="esc-reason">' + (data.reason || '') + '</span>' +
+        '<div class="escalation-actions">' +
+          '<button class="btn-preview">Show what would be sent</button>' +
+          '<button class="btn-escalate">Use Claude API</button>' +
+          '<button class="btn-dismiss">Dismiss</button>' +
+        '</div>';
+      bubbleParent.appendChild(banner);
+
+      // Preview button
+      banner.querySelector('.btn-preview').addEventListener('click', async () => {{
+        // Toggle preview panel
+        let panel = banner.querySelector('.escalation-preview');
+        if (panel) {{ panel.remove(); return; }}
+
+        const pres = await fetch('/query/escalate', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            question,
+            local_answer: localAnswer,
+            chunks_used_ids: [],
+            confirm: false,
+            redact_code: true,
+          }}),
+        }});
+        const pdata = await pres.json();
+        panel = document.createElement('div');
+        panel.className = 'escalation-preview';
+        panel.textContent = pdata.preview || '(no preview)';
+        banner.appendChild(panel);
+      }});
+
+      // Use Claude API button
+      banner.querySelector('.btn-escalate').addEventListener('click', async () => {{
+        banner.querySelector('.btn-escalate').disabled = true;
+        banner.querySelector('.btn-escalate').textContent = 'Calling Claude...';
+        try {{
+          const cres = await fetch('/query/escalate', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify({{
+              question,
+              local_answer: localAnswer,
+              chunks_used_ids: [],
+              confirm: true,
+              redact_code: true,
+            }}),
+          }});
+          const cdata = await cres.json();
+          if (cdata.error) {{
+            alert('Escalation error: ' + cdata.error);
+            return;
+          }}
+          // Show Claude answer as a new bubble
+          const wrap = document.createElement('div');
+          wrap.className = 'msg assistant';
+          const av = document.createElement('div');
+          av.className = 'avatar';
+          av.textContent = 'AI';
+          const inner = document.createElement('div');
+          const claudeBubble = document.createElement('div');
+          claudeBubble.className = 'bubble';
+          claudeBubble.textContent = cdata.answer || '';
+          const claudeBadge = document.createElement('span');
+          claudeBadge.className = 'claude-badge';
+          claudeBadge.textContent = 'Claude API';
+          inner.appendChild(claudeBubble);
+          inner.appendChild(claudeBadge);
+          wrap.appendChild(av);
+          wrap.appendChild(inner);
+          chat.appendChild(wrap);
+          chat.scrollTop = chat.scrollHeight;
+          banner.remove();
+        }} catch (err) {{
+          alert('Escalation failed: ' + err.message);
+          banner.querySelector('.btn-escalate').disabled = false;
+          banner.querySelector('.btn-escalate').textContent = 'Use Claude API';
+        }}
+      }});
+
+      // Dismiss button
+      banner.querySelector('.btn-dismiss').addEventListener('click', () => {{
+        banner.remove();
+      }});
+
+    }} catch (_) {{
+      // Silent failure -- escalation check is best-effort
+    }}
+  }}
 
   // override the send handler to use the new ask
   send.onclick = () => {{
@@ -756,6 +931,8 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
             self._ollama_generate(body)
         elif self.path == "/query":
             self._simple_query(body)
+        elif self.path == "/query/escalate":
+            self._escalate_query(body)
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1054,6 +1231,123 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
             ],
         })
 
+    # ---- Escalation endpoint ----
+
+    def _escalate_query(self, body: dict):
+        """
+        POST /query/escalate
+
+        Request body:
+            {
+                "question":        str,
+                "local_answer":    str,
+                "chunks_used_ids": list[str],   # empty => use LAST_CHUNKS
+                "confirm":         bool,         # false => preview only
+                "redact_code":     bool          # true by default
+            }
+
+        If confirm=false  -> returns preview + confidence info (no Claude call).
+        If confirm=true   -> calls Claude API and returns the upgraded answer.
+        """
+        from escalation import (
+            score_confidence,
+            build_escalation_payload,
+            escalate_to_claude,
+        )
+
+        question = body.get("question", "")
+        local_answer = body.get("local_answer", "")
+        chunks_used_ids: list[str] = body.get("chunks_used_ids", [])
+        confirm: bool = body.get("confirm", False)
+        redact_code: bool = body.get("redact_code", True)
+
+        if not question:
+            self._json({"error": "missing question"}, 400)
+            return
+
+        # Resolve chunks
+        if chunks_used_ids:
+            chunk_by_id = {c["id"]: c for c in CHUNKS}
+            chunks_for_escalation = [
+                chunk_by_id[cid] for cid in chunks_used_ids if cid in chunk_by_id
+            ]
+        else:
+            chunks_for_escalation = list(LAST_CHUNKS)
+
+        # Score confidence
+        threshold = CONFIG.get("escalation_threshold", 0.35)
+        conf = score_confidence(local_answer, question, chunks_for_escalation)
+
+        if not confirm:
+            # Preview mode -- never call Claude
+            esc_api_key = CONFIG.get("escalation_api_key", "")
+            if not esc_api_key:
+                # Server has no key -- return a minimal response
+                self._json({
+                    "should_escalate": conf["should_escalate"],
+                    "confidence_score": conf["score"],
+                    "signals": conf["signals"],
+                    "reason": conf["reason"],
+                    "escalation_available": False,
+                    "message": (
+                        "Start server with --claude-api-key to enable escalation"
+                    ),
+                })
+                return
+
+            esc = build_escalation_payload(
+                question=question,
+                chunks=chunks_for_escalation,
+                local_answer=local_answer,
+                redact_code=redact_code,
+            )
+            cost_usd = esc["estimated_tokens"] * 0.000005
+            self._json({
+                "should_escalate": conf["should_escalate"],
+                "confidence_score": conf["score"],
+                "signals": conf["signals"],
+                "reason": conf["reason"],
+                "preview": esc["preview"],
+                "estimated_tokens": esc["estimated_tokens"],
+                "estimated_cost_usd": round(cost_usd, 6),
+                "redacted": esc["redacted"],
+                "escalation_available": True,
+                "action_required": "Set confirm:true to proceed",
+            })
+            return
+
+        # confirm=True -- call Claude (requires api key)
+        esc_api_key = CONFIG.get("escalation_api_key", "")
+        if not esc_api_key:
+            self._json({
+                "error": (
+                    "Escalation API key not configured. "
+                    "Start server with --claude-api-key <key> or set ANTHROPIC_API_KEY."
+                )
+            }, 503)
+            return
+
+        esc = build_escalation_payload(
+            question=question,
+            chunks=chunks_for_escalation,
+            local_answer=local_answer,
+            redact_code=redact_code,
+        )
+
+        try:
+            claude_answer = escalate_to_claude(esc["payload"], esc_api_key)
+        except (ValueError, ConnectionError) as exc:
+            self._json({"error": str(exc)}, 502)
+            return
+
+        self._json({
+            "source": "claude-api",
+            "model": "claude-opus-4-7",
+            "answer": claude_answer,
+            "local_answer": local_answer,
+            "confidence_score": conf["score"],
+        })
+
 
 # ---------------------------------------------------------------------------
 # CLI helpers
@@ -1079,13 +1373,15 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    port        = int(_pop_arg(args, "--port")        or 8080)
-    model       = _pop_arg(args, "--model")           or "qwen2.5-coder:7b"
-    ollama_url  = _pop_arg(args, "--ollama")          or "http://localhost:11434"
-    top_k       = int(_pop_arg(args, "--top-k")       or 6)
-    embed_model = _pop_arg(args, "--embed-model")     or "nomic-embed-text"
-    api_key     = _pop_arg(args, "--api-key")         or ""
-    chroma_dir  = _pop_arg(args, "--chroma-dir")      or None
+    port                 = int(_pop_arg(args, "--port")                or 8080)
+    model                = _pop_arg(args, "--model")                   or "qwen2.5-coder:7b"
+    ollama_url           = _pop_arg(args, "--ollama")                  or "http://localhost:11434"
+    top_k                = int(_pop_arg(args, "--top-k")               or 6)
+    embed_model          = _pop_arg(args, "--embed-model")             or "nomic-embed-text"
+    api_key              = _pop_arg(args, "--api-key")                 or ""
+    chroma_dir           = _pop_arg(args, "--chroma-dir")              or None
+    escalation_threshold = float(_pop_arg(args, "--escalation-threshold") or 0.35)
+    claude_api_key_arg   = _pop_arg(args, "--claude-api-key")          or ""
     use_embed   = "--embed"   in args
     use_claude  = "--claude"  in args
     use_rerank  = "--rerank"  in args
@@ -1140,6 +1436,18 @@ def main():
             print(f"Error initialising ChromaDB: {exc}", file=sys.stderr)
             sys.exit(1)
 
+    # Resolve escalation API key: explicit arg > env var
+    escalation_api_key = (
+        claude_api_key_arg
+        or os.environ.get("ANTHROPIC_API_KEY", "")
+        # If --claude flag is set the main api_key already came from env
+    )
+    # But don't duplicate the primary claude key into the escalation slot
+    # unless it was explicitly supplied via --claude-api-key.
+    if not escalation_api_key and use_claude:
+        # When running with --claude the primary api_key IS the Anthropic key
+        escalation_api_key = api_key
+
     CONFIG = {
         "model": model,
         "ollama_url": ollama_url,
@@ -1151,6 +1459,8 @@ def main():
         "use_rerank": use_rerank,
         "use_chroma": use_chroma,
         "chroma_collection": chroma_collection,
+        "escalation_threshold": escalation_threshold,
+        "escalation_api_key": escalation_api_key,
     }
 
     retrieval = f"semantic ({embed_model})" if use_embed else "TF-IDF"
@@ -1164,10 +1474,15 @@ def main():
     print(f"  Retrieval  : {retrieval}{rerank_label}{vector_store_label}  |  top_k: {top_k}")
     print(f"  Port       : {port}")
     print()
+    escalation_label = (
+        f"enabled (threshold={escalation_threshold})"
+        if escalation_api_key else "disabled (no --claude-api-key)"
+    )
     print(f"  OpenAI endpoint   : http://localhost:{port}/v1/chat/completions")
     print(f"  Anthropic endpoint: http://localhost:{port}/v1/messages")
     print(f"  Ollama endpoint   : http://localhost:{port}/api/chat")
     print(f"  Health check      : http://localhost:{port}/health")
+    print(f"  Escalation        : http://localhost:{port}/query/escalate  [{escalation_label}]")
     print()
     print(f"  Connect Open WebUI      -> Ollama URL: http://localhost:{port}")
     print(f"  Connect OpenAI client   -> base_url=http://localhost:{port}/v1   api_key=rag")
