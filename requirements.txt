@@ -1,0 +1,22 @@
+# CodeIntelligence — Python dependencies
+#
+# CORE (zero dependencies — stdlib only)
+# parse_repo.py, ask_repo_local.py, embed_chunks.py, rag_server.py
+# all run with no pip installs at all in their default (TF-IDF) mode.
+#
+# The packages below are OPTIONAL — install only what you need.
+# --------------------------------------------------------------------
+
+# --- Claude API backend (ask_repo.py + rag_server.py --claude) ------
+anthropic>=0.25.0
+
+# --- Cross-encoder re-ranking (--rerank flag) -----------------------
+# Loads: cross-encoder/ms-marco-MiniLM-L-6-v2 from HuggingFace (~85 MB)
+sentence-transformers>=3.0.0
+
+# --- Persistent vector store (--chroma flag) ------------------------
+chromadb>=0.5.0
+
+# --- FastEmbed in-process embeddings (alternative to Ollama) --------
+# Lighter than sentence-transformers, no server needed
+# fastembed>=0.2.0
