@@ -583,11 +583,12 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
 
   const exportBtn = document.getElementById('export-btn');
 
-  function recordTurn(question, answer) {{
+  function recordTurn(question, answer, elapsed_ms) {{
     SESSION.turns.push({{
       timestamp: new Date().toISOString(),
       question,
       answer,
+      elapsed_ms,
     }});
     exportBtn.disabled = false;
   }}
@@ -606,9 +607,12 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
       '',
     ];
     SESSION.turns.forEach((t, i) => {{
+      const secs = t.elapsed_ms != null ? (t.elapsed_ms / 1000).toFixed(1) + 's' : 'n/a';
       lines.push(`## Q${{i+1}} — ${{t.timestamp.replace('T',' ').slice(0,19)}} UTC`);
       lines.push('');
       lines.push(`**Question:** ${{t.question}}`);
+      lines.push('');
+      lines.push(`**Response time:** ${{secs}}`);
       lines.push('');
       lines.push(`**Answer:**`);
       lines.push('');
@@ -656,6 +660,15 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
     addMessage('user', question);
     const thinking = addThinking();
     let fullAnswer = '';
+    const t0 = Date.now();
+
+    // live timer shown inside the thinking indicator
+    const timerSpan = document.createElement('span');
+    timerSpan.style.cssText = 'margin-left:8px;font-size:0.78em;opacity:0.6;font-variant-numeric:tabular-nums;';
+    thinking.appendChild(timerSpan);
+    const timerInterval = setInterval(() => {{
+      timerSpan.textContent = ((Date.now() - t0) / 1000).toFixed(1) + 's';
+    }}, 100);
 
     try {{
       const res = await fetch('/v1/chat/completions', {{
@@ -668,6 +681,7 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
         }}),
       }});
 
+      clearInterval(timerInterval);
       thinking.remove();
       const bubble = addMessage('assistant', '');
       const reader = res.body.getReader();
@@ -691,13 +705,23 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
           }} catch {{}}
         }}
       }}
+
+      // elapsed badge under the answer bubble
+      const elapsed_ms = Date.now() - t0;
+      const badge = document.createElement('div');
+      badge.style.cssText = 'font-size:0.72em;opacity:0.45;margin-top:4px;text-align:right;';
+      badge.textContent = '⏱ ' + (elapsed_ms / 1000).toFixed(1) + 's';
+      bubble.parentNode.appendChild(badge);
+
     }} catch (e) {{
+      clearInterval(timerInterval);
       thinking.remove();
       addMessage('assistant', 'Error: ' + e.message);
       fullAnswer = 'Error: ' + e.message;
     }}
 
-    recordTurn(question, fullAnswer);
+    const elapsed_ms = Date.now() - t0;
+    recordTurn(question, fullAnswer, elapsed_ms);
     send.disabled = false;
     input.focus();
   }};

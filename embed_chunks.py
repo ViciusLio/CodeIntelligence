@@ -11,8 +11,9 @@ Usage:
     python embed_chunks.py <chunks.jsonl>
     python embed_chunks.py <chunks.jsonl> --output embedded.jsonl
     python embed_chunks.py <chunks.jsonl> --model nomic-embed-text
-    python embed_chunks.py <chunks.jsonl> --resume       # skip already-embedded chunks
-    python embed_chunks.py <chunks.jsonl> --incremental  # skip unchanged source files
+    python embed_chunks.py <chunks.jsonl> --resume                    # skip already-embedded chunks
+    python embed_chunks.py <chunks.jsonl> --incremental               # skip unchanged source files
+    python embed_chunks.py <chunks.jsonl> --incremental --repo-root ../my-repo  # source files in another dir
 
 Requires:
     ollama pull nomic-embed-text   (~270 MB, fast)
@@ -124,9 +125,10 @@ def main():
         print(__doc__)
         sys.exit(0)
 
-    model    = _pop_arg(args, "--model")  or "nomic-embed-text"
-    base_url = _pop_arg(args, "--url")    or "http://localhost:11434"
+    model    = _pop_arg(args, "--model")     or "nomic-embed-text"
+    base_url = _pop_arg(args, "--url")       or "http://localhost:11434"
     output   = _pop_arg(args, "--output")
+    repo_root = _pop_arg(args, "--repo-root")
     resume   = "--resume" in args
     incremental = "--incremental" in args
     if resume:
@@ -166,8 +168,11 @@ def main():
         new_hashes: dict[str, str] = {}
 
         # Determine the repo root: we need to resolve source file paths.
-        # We'll look for them relative to the input_path's parent directory and cwd.
-        search_roots = [input_path.parent, Path(".").resolve()]
+        # Check --repo-root first, then input_path's parent, then cwd.
+        search_roots = []
+        if repo_root:
+            search_roots.append(Path(repo_root).resolve())
+        search_roots += [input_path.parent, Path(".").resolve()]
 
         # Collect all distinct source file slugs from the chunks
         source_files: set[str] = set()
