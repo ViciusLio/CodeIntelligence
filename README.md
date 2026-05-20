@@ -130,10 +130,18 @@ Open **http://localhost:8080** — the built-in chat UI is ready.
 
 - Dark theme, streaming tokens visible as they arrive
 - Live timer showing response time (also saved in session export)
-- Confidence badge on every response
-- **Orange escalation banner** when the local model is uncertain (see below)
-- Session export to Markdown or JSON (includes response times)
+- Confidence score badge on every response (e.g. `Confidence score: 25%`)
+- **Orange pulsing escalation banner** when the local model is uncertain (see below)
+- Session export to Markdown or JSON — includes response times and full escalation turns
 - Enter to send, Shift+Enter for new line
+
+Session export captures escalated answers in full:
+```markdown
+## Q2 — [Escalated] How does the WebSocket real-time notification system work?
+**Response time:** n/a
+[Local] The provided context does not contain any information…
+[Claude API] The only context chunk available is a single test function…
+```
 
 ---
 
@@ -226,10 +234,24 @@ When the local model responds with low confidence, the system detects it automat
 ### How it works
 
 1. After each local model response, the server scores confidence in the background
-2. Signals of low confidence: uncertainty phrases ("I cannot find", "not present in the context"), no file paths cited, very short answer to a navigation question
-3. If score < threshold (default 0.35): orange banner appears under the response
+2. Signals of low confidence detected automatically:
+   - Uncertainty phrases: "I cannot find", "not present in", "does not include any", "not explicitly", "additional context or", "would need additional", and ~20 more patterns tuned for local models (qwen2.5-coder, codellama, llama3…)
+   - No file paths cited in answer to a navigation question
+   - Very short answer (<80 words) to a "where/how/which" question
+   - Fewer than 3 context chunks used
+3. If score < threshold (default 0.35): orange pulsing banner appears under the response
 4. User can preview exactly what would be sent (with optional code body anonymization)
 5. User clicks "Use Claude API" to confirm — only then is data sent
+
+### Real example
+
+Local model (qwen2.5-coder:7b, top_k=1, score: 0%):
+> *"The provided context does not contain any information about a WebSocket real-time notification system…"*
+
+Claude API (claude-opus-4-7):
+> *"The only context chunk available is a single test function (`test_emit_returns_notification`). This chunk does not contain any information about WebSocket connections, real-time message delivery, or client subscription mechanisms. To answer your question, I would need the `NotificationService` class implementation, any WebSocket route/handler files, or connection manager code."*
+
+Claude's answer is more actionable: it names exactly what's missing and what to look for.
 
 ### Setup
 
@@ -247,7 +269,7 @@ python rag_server.py repo_chunks_embedded.jsonl --embed --rerank --model qwen2.5
 
 The startup log confirms escalation status:
 ```
-Escalation : http://localhost:8080/query/escalate  [enabled, threshold: 0.35]
+Escalation : http://localhost:8080/query/escalate  [enabled (threshold=0.35)]
 ```
 
 ### Escalation API endpoint
