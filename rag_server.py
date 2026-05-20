@@ -884,6 +884,8 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
           chat.appendChild(wrap);
           chat.scrollTop = chat.scrollHeight;
           banner.remove();
+          // Record escalated answer in session export
+          recordTurn('[Escalated] ' + question, '[Local] ' + localAnswer + '\n\n[Claude API] ' + (cdata.answer || ''), null);
         }} catch (err) {{
           alert('Escalation failed: ' + err.message);
           banner.querySelector('.btn-escalate').disabled = false;
