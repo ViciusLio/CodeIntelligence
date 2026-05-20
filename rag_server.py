@@ -439,10 +439,16 @@ class RAGHandler(BaseHTTPRequestHandler):
   #send:disabled {{ background: #2d3748; cursor: not-allowed; }}
   .hint {{ text-align: center; font-size: 0.72rem; color: #334155; margin-top: 8px; }}
   /* Escalation banner */
+  @keyframes esc-pulse {{
+    0%   {{ border-left-color: #f97316; }}
+    50%  {{ border-left-color: #fbbf24; }}
+    100% {{ border-left-color: #f97316; }}
+  }}
   .escalation-banner {{
-    background: #7c3a00; border-left: 3px solid #f97316;
+    background: #7c3a00; border-left: 4px solid #f97316;
     padding: 12px; border-radius: 6px; font-size: 0.85em;
-    margin-top: 6px; color: #fed7aa;
+    margin-top: 8px; color: #fed7aa;
+    animation: esc-pulse 1.5s ease-in-out 3;
   }}
   .escalation-banner .esc-reason {{
     display: block; font-size: 0.82em; color: #fdba74; margin-top: 2px;
@@ -818,6 +824,7 @@ Try something like: <em>"How does authentication work?"</em> or <em>"Where is th
           '<button class="btn-dismiss">Dismiss</button>' +
         '</div>';
       bubbleParent.appendChild(banner);
+      scrollBottom();
 
       // Preview button
       banner.querySelector('.btn-preview').addEventListener('click', async () => {{
