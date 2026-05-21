@@ -17,7 +17,7 @@ Instead of pasting code into a chat or hoping the model knows your codebase, you
 
 1. **Parse** the repo into semantic chunks (one per file, function, class)
 2. **Embed** the chunks with a local model (optional but recommended)
-3. **Query** with a local LLM (Ollama) or Claude API — via CLI or a built-in chat UI
+3. **Query** with a local LLM (Ollama, llama.cpp, LM Studio, vLLM…) or Claude API — via CLI or a built-in chat UI
 
 Ask questions like *"Where is JWT authentication implemented?"* or *"Who calls `create_access_token`?"* and get precise, source-cited answers.
 
