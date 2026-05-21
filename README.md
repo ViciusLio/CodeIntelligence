@@ -3,7 +3,8 @@
 > **Query any codebase in natural language — fully local, zero API key, zero data leaving your machine.**
 
 [![Tests](https://img.shields.io/badge/tests-76%20passing-brightgreen)](#)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](#)
+[![Python 3.9+](https://img.shields.io/badge/runtime-Python%203.9%2B-blue)](#)
+[![Languages](https://img.shields.io/badge/parses-Python%20%7C%20TypeScript%20%7C%20Go%20%7C%20YAML%20%7C%20SQL%20%7C%20Markdown-informational)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---

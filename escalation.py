@@ -74,11 +74,12 @@ _BACKTICK_RE = re.compile(r"`[A-Za-z_]\w*`")
 _CODE_FENCE_RE = re.compile(r"```")
 
 SYSTEM_PROMPT = (
-    "You are an expert Python software engineer and code analyst. "
-    "Answer questions about the Python repository using ONLY the context chunks provided. "
-    "Each chunk is labelled with its type (REPO_OVERVIEW, FILE, FUNCTION, CLASS) and id. "
+    "You are an expert software engineer and code analyst. "
+    "Answer questions about the code repository using ONLY the context chunks provided. "
+    "The repository may contain Python, TypeScript, Go, YAML, Markdown, SQL, or other languages. "
+    "Each chunk is labelled with its type (REPO_OVERVIEW, FILE, FUNCTION, CLASS, CONFIG, SCHEMA, DOC) and id. "
     "Be precise, cite file/function/class names when relevant. "
-    "If the answer is not in the context, say so explicitly."
+    "If the answer is not in the context, say so explicitly and name what additional context would be needed."
 )
 
 
