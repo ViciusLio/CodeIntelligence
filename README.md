@@ -2,7 +2,7 @@
 
 > **Query any codebase in natural language — fully local, zero API key, zero data leaving your machine.**
 
-[![Tests](https://img.shields.io/badge/tests-76%20passing-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-92%20passing-brightgreen)](#)
 [![Python 3.9+](https://img.shields.io/badge/runtime-Python%203.9%2B-blue)](#)
 [![Languages](https://img.shields.io/badge/parses-Python%20%7C%20TypeScript%20%7C%20Go%20%7C%20YAML%20%7C%20SQL%20%7C%20Markdown-informational)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -28,23 +28,25 @@ Ask questions like *"Where is JWT authentication implemented?"* or *"Who calls `
 | Feature | v1 | v2 |
 |---|---|---|
 | Languages parsed | Python only | Python, TypeScript, Go, YAML, Markdown, SQL |
+| Generation backend | Ollama only | Ollama · llama.cpp · LM Studio · vLLM · Claude API |
 | Context awareness | Code only | Code + environment (deps, git, docker, tests...) |
 | Low-confidence detection | None | Automatic — escalates to Claude API with opt-in |
-| Test suite | — | 76 tests (unittest, stdlib only) |
+| Test suite | — | 92 tests (unittest, stdlib only) |
 | Parser architecture | Single file | Plugin system (`parsers/`) |
 
 ---
 
 ## Local or Cloud — your choice
 
-| | Local (Ollama) | Cloud (Claude API) |
-|--|----------------|--------------------|
-| **Script** | `ask_repo_local.py` / `rag_server.py` | `ask_repo.py` |
-| **Model** | qwen2.5-coder, codellama, llama3... | claude-opus-4-7 |
-| **API key** | not required | `ANTHROPIC_API_KEY` |
-| **Data privacy** | stays on your machine | sent to Anthropic |
-| **Quality** | good (7B-13B models) | excellent |
-| **Cost** | free | pay per token |
+| | Ollama (default) | llama.cpp / LM Studio | Cloud (Claude API) |
+|--|------------------|-----------------------|--------------------|
+| **Flag** | *(default)* | `--oai-url <url>` | `--claude` |
+| **Model** | qwen2.5-coder, codellama… | any GGUF model | claude-opus-4-7 |
+| **API key** | not required | not required | `ANTHROPIC_API_KEY` |
+| **Data privacy** | stays on your machine | stays on your machine | sent to Anthropic |
+| **Speed** | good | **up to 10× faster** (llama.cpp) | excellent |
+| **Quality** | good (7B-13B) | good (7B-13B) | excellent |
+| **Cost** | free | free | pay per token |
 
 ---
 
@@ -76,10 +78,11 @@ CodeIntelligence/
 |-- chroma_store.py          # ChromaDB persistent vector store (optional)
 |-- run_benchmark.py         # Automated benchmark evaluation
 |
-`-- tests/                   # 76 tests (unittest, stdlib only)
-    |-- test_multilang_parser.py   # 30 tests
-    |-- test_context_collector.py  # 25 tests
-    `-- test_escalation.py         # 21 tests
+`-- tests/                   # 92 tests (unittest, stdlib only)
+    |-- test_multilang_parser.py      # 30 tests
+    |-- test_context_collector.py     # 25 tests
+    |-- test_escalation.py            # 21 tests
+    `-- test_rag_server_backends.py   # 16 tests (OAI backend routing)
 ```
 
 ---
@@ -120,7 +123,17 @@ python embed_chunks.py repo_chunks.jsonl --incremental --repo-root /path/to/repo
 ### Step 3 — Start the server
 
 ```bash
+# Ollama backend (default)
 python rag_server.py repo_chunks_embedded.jsonl --embed --rerank --model qwen2.5-coder:7b
+
+# llama.cpp backend (up to 10× faster — any OpenAI-compatible server)
+# Start llama-server first: llama-server -m model.gguf --port 8081
+python rag_server.py repo_chunks_embedded.jsonl --embed --rerank \
+    --oai-url http://localhost:8081 --model llama3
+
+# LM Studio, vLLM, LocalAI — same flag, different URL
+python rag_server.py repo_chunks_embedded.jsonl --embed --rerank \
+    --oai-url http://localhost:1234 --model mistral
 ```
 
 Open **http://localhost:8080** — the built-in chat UI is ready.
@@ -386,14 +399,22 @@ python ask_repo_local.py <chunks.jsonl> ["question"] [options]
 python rag_server.py <chunks.jsonl> [options]
 
   --port              Listening port           (default: 8080)
-  --model             Ollama LLM model         (default: qwen2.5-coder:7b)
+  --model             LLM model name           (default: qwen2.5-coder:7b)
   --top-k             Chunks per query         (default: 6)
   --embed             Use semantic retrieval
   --embed-model       Embedding model          (default: nomic-embed-text)
   --rerank            Re-score with cross-encoder
   --chroma            Use ChromaDB vector store (requires --embed)
+
+  Generation backend (mutually exclusive priority: Claude > OAI > Ollama):
+  --ollama <url>      Ollama base URL          (default: http://localhost:11434)
+  --oai-url <url>     OpenAI-compatible base URL for inference
+                      Works with: llama.cpp, LM Studio, vLLM, LocalAI, ...
+  --oai-embed-url <url>  OAI-compatible embeddings URL (optional, falls back to Ollama)
   --claude            Use Claude API as generation backend
   --api-key           Anthropic API key for --claude backend
+
+  Escalation:
   --claude-api-key    Anthropic API key for escalation endpoint
   --escalation-threshold  Confidence score threshold (default: 0.35)
                           0 = never escalate, 1 = always escalate
@@ -442,7 +463,7 @@ python rag_server.py ci_bench_L2_chunks_embedded.jsonl --embed --rerank --model 
 ```bash
 pip install pytest
 python -m pytest tests/ -v
-# 76 passed
+# 92 passed
 ```
 
 ---

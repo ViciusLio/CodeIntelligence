@@ -10,8 +10,13 @@ Usage:
 
 Options:
     --port     <n>     Listening port          (default: 8080)
-    --model    <name>  Ollama LLM model        (default: qwen2.5-coder:7b)
+    --model    <name>  LLM model name          (default: qwen2.5-coder:7b)
     --ollama   <url>   Ollama base URL         (default: http://localhost:11434)
+    --oai-url  <url>   OpenAI-compatible base URL for inference
+                       (e.g. http://localhost:8081 for llama.cpp / LM Studio / vLLM)
+                       Overrides Ollama for chat completions.
+    --oai-embed-url <url>  OpenAI-compatible base URL for embeddings
+                           (optional; falls back to Ollama when omitted)
     --top-k    <n>     Chunks per query        (default: 6)
     --embed            Use semantic retrieval  (needs embed_chunks.py output)
     --embed-model <m>  Embedding model         (default: nomic-embed-text)
@@ -112,6 +117,19 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def _embed_text(text: str) -> list[float]:
+    if CONFIG.get("oai_embed_url"):
+        payload = json.dumps({
+            "model": CONFIG["embed_model"],
+            "input": text,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{CONFIG['oai_embed_url']}/v1/embeddings",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())["data"][0]["embedding"]
     payload = json.dumps({
         "model": CONFIG["embed_model"],
         "prompt": text,
@@ -198,11 +216,12 @@ def build_context(chunks: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = (
-    "You are an expert Python software engineer and code analyst. "
-    "Answer questions about the Python repository using ONLY the context chunks provided. "
-    "Each chunk is labelled with its type (REPO_OVERVIEW, FILE, FUNCTION, CLASS) and id. "
+    "You are an expert software engineer and code analyst. "
+    "Answer questions about the code repository using ONLY the context chunks provided. "
+    "The repository may contain Python, TypeScript, Go, YAML, Markdown, SQL, or other languages. "
+    "Each chunk is labelled with its type (REPO_OVERVIEW, FILE, FUNCTION, CLASS, CONFIG, SCHEMA, DOC) and id. "
     "Be precise, cite file/function/class names when relevant. "
-    "If the answer is not in the context, say so explicitly."
+    "If the answer is not in the context, say so explicitly and name what additional context would be needed."
 )
 
 
@@ -240,6 +259,59 @@ def _ollama_chat_complete(messages: list[dict]) -> str:
     with urllib.request.urlopen(req) as resp:
         obj = json.loads(resp.read())
     return obj.get("message", {}).get("content", "")
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible generation (llama.cpp, LM Studio, vLLM, ...)
+# ---------------------------------------------------------------------------
+
+def _oai_chat_stream(messages: list[dict]):
+    """Generator: yields str tokens from an OpenAI-compatible streaming response."""
+    payload = json.dumps({
+        "model": CONFIG["model"],
+        "stream": True,
+        "messages": messages,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{CONFIG['oai_url']}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8").strip()
+            if not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+                token = obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                if token:
+                    yield token
+            except json.JSONDecodeError:
+                continue
+
+
+def _oai_chat_complete(messages: list[dict]) -> str:
+    """Non-streaming OpenAI-compatible call."""
+    payload = json.dumps({
+        "model": CONFIG["model"],
+        "stream": False,
+        "messages": messages,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{CONFIG['oai_url']}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        obj = json.loads(resp.read())
+    choices = obj.get("choices") or []
+    return choices[0].get("message", {}).get("content", "") if choices else ""
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +359,7 @@ def build_messages(question: str, history: list[dict] | None = None) -> tuple[li
     LAST_CHUNKS = relevant   # remember for /query/escalate
     context = build_context(relevant)
     augmented_question = (
-        f"Context from the Python repository:\n\n{context}\n\n"
+        f"Context from the repository:\n\n{context}\n\n"
         f"---\n\nQuestion: {question}"
     )
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -299,19 +371,24 @@ def build_messages(question: str, history: list[dict] | None = None) -> tuple[li
 
 
 def _chat_stream(messages: list[dict]):
-    """Route streaming to Claude or Ollama based on config."""
+    """Route streaming to the configured backend. Yields str tokens (Claude/OAI) or bytes lines (Ollama)."""
     if CONFIG.get("use_claude"):
         for token in _claude_chat_stream(messages):
-            yield token   # yields str tokens
+            yield token
+    elif CONFIG.get("use_oai"):
+        for token in _oai_chat_stream(messages):
+            yield token
     else:
         for line in _ollama_chat_stream(messages):
-            yield line    # yields bytes lines
+            yield line
 
 
 def _chat_complete(messages: list[dict]) -> str:
-    """Route non-streaming to Claude or Ollama based on config."""
+    """Route non-streaming to the configured backend."""
     if CONFIG.get("use_claude"):
         return _claude_chat_complete(messages)
+    if CONFIG.get("use_oai"):
+        return _oai_chat_complete(messages)
     return _ollama_chat_complete(messages)
 
 
@@ -330,7 +407,12 @@ class RAGHandler(BaseHTTPRequestHandler):
         if self.path in ("/", "/ui"):
             self._serve_ui()
         elif self.path == "/health":
-            backend = "claude" if CONFIG.get("use_claude") else "ollama"
+            if CONFIG.get("use_claude"):
+                backend = "claude"
+            elif CONFIG.get("use_oai"):
+                backend = "oai-compat"
+            else:
+                backend = "ollama"
             reranker = "cross-encoder" if CONFIG.get("use_rerank") else "none"
             vector_store = "chroma" if CONFIG.get("use_chroma") else "numpy_in_memory"
             self._json({
@@ -350,7 +432,12 @@ class RAGHandler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def _serve_ui(self):
-        backend = "Claude API" if CONFIG.get("use_claude") else f"Ollama · {CONFIG['model']}"
+        if CONFIG.get("use_claude"):
+            backend = "Claude API"
+        elif CONFIG.get("use_oai"):
+            backend = f"llama.cpp-compat · {CONFIG['model']}"
+        else:
+            backend = f"Ollama · {CONFIG['model']}"
         retrieval = "Semantic" if CONFIG.get("use_embed") else "TF-IDF"
         chunks_count = len(CHUNKS)
         html = f"""<!DOCTYPE html>
@@ -496,7 +583,7 @@ class RAGHandler(BaseHTTPRequestHandler):
   <div class="msg assistant">
     <div class="avatar">AI</div>
     <div>
-      <div class="bubble">Hi! Ask me anything about this Python repository.
+      <div class="bubble">Hi! Ask me anything about this repository.
 I have {chunks_count} semantic chunks indexed and ready.
 Try something like: <em>"How does authentication work?"</em> or <em>"Where is the rate limiter implemented?"</em></div>
     </div>
@@ -1387,6 +1474,8 @@ def main():
     port                 = int(_pop_arg(args, "--port")                or 8080)
     model                = _pop_arg(args, "--model")                   or "qwen2.5-coder:7b"
     ollama_url           = _pop_arg(args, "--ollama")                  or "http://localhost:11434"
+    oai_url              = _pop_arg(args, "--oai-url")                 or ""
+    oai_embed_url        = _pop_arg(args, "--oai-embed-url")           or ""
     top_k                = int(_pop_arg(args, "--top-k")               or 6)
     embed_model          = _pop_arg(args, "--embed-model")             or "nomic-embed-text"
     api_key              = _pop_arg(args, "--api-key")                 or ""
@@ -1397,6 +1486,7 @@ def main():
     use_claude  = "--claude"  in args
     use_rerank  = "--rerank"  in args
     use_chroma  = "--chroma"  in args
+    use_oai     = bool(oai_url)
     if use_embed:  args.remove("--embed")
     if use_claude: args.remove("--claude")
     if use_rerank: args.remove("--rerank")
@@ -1462,6 +1552,9 @@ def main():
     CONFIG = {
         "model": model,
         "ollama_url": ollama_url,
+        "use_oai": use_oai,
+        "oai_url": oai_url,
+        "oai_embed_url": oai_embed_url,
         "top_k": top_k,
         "use_embed": use_embed,
         "embed_model": embed_model,
@@ -1477,7 +1570,13 @@ def main():
     retrieval = f"semantic ({embed_model})" if use_embed else "TF-IDF"
     rerank_label = " + cross-encoder rerank" if use_rerank else ""
     vector_store_label = " [ChromaDB]" if use_chroma else " [numpy in-memory]"
-    backend = f"Claude API ({model})" if use_claude else f"Ollama ({model} at {ollama_url})"
+    if use_claude:
+        backend = f"Claude API ({model})"
+    elif use_oai:
+        embed_suffix = f" | embeddings → {oai_embed_url}" if oai_embed_url else " | embeddings → Ollama"
+        backend = f"OAI-compat ({model} at {oai_url}{embed_suffix})"
+    else:
+        backend = f"Ollama ({model} at {ollama_url})"
 
     print(f"RAG Server starting...")
     print(f"  Chunks     : {len(CHUNKS)} from {jsonl_path.name}")
